@@ -28,7 +28,7 @@
 #include "nm_alloc.h"
 #include "events.h"
 #ifdef HAVE_JSONC
-#include <json-c/json.h>
+#include "nerd_json.h"
 #endif
 struct nerd_channel {
 	const char *name; /* name of this channel */
@@ -230,6 +230,14 @@ int nerd_broadcast(unsigned int chan_id, void *buf, unsigned int len)
 	return 0;
 }
 
+int nerd_channel_has_subscriptions(unsigned int chan_id)
+{
+	if (channels[chan_id]->subscriptions == NULL){
+		return 0;
+	}
+	// Channel has subscriptions
+	return 1;
+}
 
 static int chan_host_checks(int cb, void *data)
 {
@@ -398,14 +406,13 @@ int nerd_init(void)
 	                                     "Service check results",
 	                                     chan_service_checks, nebcallback_flag(NEBCALLBACK_SERVICE_CHECK_DATA));
 
-	nm_log(NSLOG_INFO_MESSAGE, "nerd: Fully initialized and ready to rock!\n");
-
 #ifdef HAVE_JSONC
-	nm_log(NSLOG_INFO_MESSAGE, "nerd: We have json Superpowers!\n");
+	// json-c is available - lets add some JSON encoeded services to nerd
+	nerd_init_json();
 #else
-    // Handle the case where json-c is not available
-    nm_log(NSLOG_INFO_MESSAGE, "nerd: json-c is not available\n");
+	// Handle the case where json-c is not available
+	nm_log(NSLOG_INFO_MESSAGE, "nerd: json-c is not available\n");
 #endif
-
+	nm_log(NSLOG_INFO_MESSAGE, "nerd: Fully initialized and ready to rock!\n");
 	return 0;
 }

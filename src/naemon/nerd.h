@@ -23,6 +23,7 @@ int nerd_cancel_subscriber(int sd);
 int nerd_get_channel_id(const char *chan_name);
 objectlist *nerd_get_subscriptions(int chan_id);
 int nerd_broadcast(unsigned int chan_id, void *buf, unsigned int len);
+int nerd_channel_has_subscriptions(unsigned int chan_id);
 
 NAGIOS_END_DECL
 

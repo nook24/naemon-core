@@ -98,6 +98,7 @@ common_sources = \
 	src/naemon/nebmods.c src/naemon/nebmods.h \
 	src/naemon/nebmodules.h src/naemon/nebstructs.h \
 	src/naemon/nerd.c src/naemon/nerd.h \
+	src/naemon/nerd_json.c src/naemon/nerd_json.h \
 	src/naemon/nm_alloc.c src/naemon/nm_alloc.h \
 	src/naemon/notifications.c src/naemon/notifications.h \
 	src/naemon/objectlist.c src/naemon/objectlist.h \
