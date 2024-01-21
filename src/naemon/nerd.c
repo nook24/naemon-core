@@ -27,7 +27,9 @@
 #include "globals.h"
 #include "nm_alloc.h"
 #include "events.h"
-
+#ifdef HAVE_JSONC
+#include <json-c/json.h>
+#endif
 struct nerd_channel {
 	const char *name; /* name of this channel */
 	const char *description; /* user-presentable string to document the purpose of this channel */
@@ -397,5 +399,13 @@ int nerd_init(void)
 	                                     chan_service_checks, nebcallback_flag(NEBCALLBACK_SERVICE_CHECK_DATA));
 
 	nm_log(NSLOG_INFO_MESSAGE, "nerd: Fully initialized and ready to rock!\n");
+
+#ifdef HAVE_JSONC
+	nm_log(NSLOG_INFO_MESSAGE, "nerd: We have json Superpowers!\n");
+#else
+    // Handle the case where json-c is not available
+    nm_log(NSLOG_INFO_MESSAGE, "nerd: json-c is not available\n");
+#endif
+
 	return 0;
 }

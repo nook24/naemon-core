@@ -42,6 +42,14 @@ AM_CONDITIONAL([HAVE_CHECK], [test "x$with_tests" = "xyes"])
 
 PKG_CHECK_MODULES([GLIB], [glib-2.0])
 
+# Checks for optional json-c library.
+PKG_CHECK_MODULES([JSONC], [json-c >= 0.11], [have_jsonc=yes], [have_jsonc=no])
+AM_CONDITIONAL([HAVE_JSONC], [test x$have_jsonc = xyes])
+
+if test "x$have_jsonc" = "xyes"; then
+  AC_DEFINE([HAVE_JSONC], [1], [Define if you have the json-c library])
+fi
+
 AM_MISSING_PROG([PROVE], [prove])
 AM_MISSING_PROG([GPERF], [gperf])
 AM_MISSING_PROG([HELP2MAN], [help2man])

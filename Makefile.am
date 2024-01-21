@@ -154,6 +154,14 @@ src_naemonstats_naemonstats_SOURCES = src/naemonstats/naemonstats.c src/naemon/b
 LDADD = libnaemon.la $(GLIB_LIBS) -lm -ldl
 lib_LTLIBRARIES = libnaemon.la
 
+# If HAVE_JSONC is true, include json-c library
+if HAVE_JSONC
+src_naemon_naemon_CPPFLAGS += $(JSONC_CFLAGS)
+src_naemon_naemon_LDFLAGS += $(JSONC_LIBS)
+AM_CPPFLAGS += $(JSONC_CFLAGS)
+LDADD += $(JSONC_LIBS)
+endif
+
 # details on library version numbers https://www.sourceware.org/autobook/autobook/autobook_91.html
 libnaemon_la_LDFLAGS = -version-info 0:0:0
 libnaemon_la_LIBADD = $(GLIB_LIBS)
