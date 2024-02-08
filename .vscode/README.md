@@ -74,7 +74,7 @@ The steps are the exactly the same as described above. We recommend to use the [
 to get access to the Linux shell.
 
 Make sure you have Visual Studio Code installed on your Windows System. To launch VS Code with the files
-from the Naemon project, simply run the `code` command.
+from the Naemon project, simply run the `code .` command.
 
 Run these commands on your WSL linux instance:
 ```
