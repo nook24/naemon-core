@@ -373,6 +373,7 @@ int update_host_state_post_check(struct host *hst, struct check_result *cr)
 {
 	int result;
 	char *temp_ptr = NULL;
+	time_t now = time(NULL);
 
 	if (!hst || !cr)
 		return ERROR;
@@ -413,6 +414,7 @@ int update_host_state_post_check(struct host *hst, struct check_result *cr)
 
 	/* get the last check time */
 	hst->last_check = cr->start_time.tv_sec;
+	hst->last_update = now;
 
 	/* save the old host state */
 	hst->last_state = hst->current_state;
@@ -629,6 +631,7 @@ static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags)
 {
 	check_result *cr = (check_result *)arg;
 	struct host *hst;
+	time_t now = time(NULL);
 
 	/* decrement the number of host checks still out there... */
 	if (currently_running_host_checks > 0)
@@ -638,6 +641,7 @@ static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags)
 		hst = find_host(cr->host_name);
 		if (hst) {
 			hst->is_executing = FALSE;
+			hst->last_update = now;
 			memcpy(&cr->rusage, &wpres->rusage, sizeof(wpres->rusage));
 			cr->start_time.tv_sec = wpres->start.tv_sec;
 			cr->start_time.tv_usec = wpres->start.tv_usec;
@@ -1008,14 +1012,18 @@ static int handle_host_state(host *hst, int *alert_recorded)
 		/* update the problem id when transitioning to a problem state */
 		if (hst->last_state == STATE_UP) {
 			/* don't reset last problem id, or it will be zero the next time a problem is encountered */
-			hst->current_problem_id = next_problem_id;
-			next_problem_id++;
+			nm_free(hst->current_problem_id);
+			hst->current_problem_id = (char*)g_uuid_string_random();
+			hst->problem_start = current_time;
+			hst->problem_end = 0L;
 		}
 
 		/* clear the problem id when transitioning from a problem state to an UP state */
 		if (hst->current_state == STATE_UP) {
 			hst->last_problem_id = hst->current_problem_id;
-			hst->current_problem_id = 0L;
+			hst->current_problem_id = NULL;
+			if(hst->problem_start > 0)
+				hst->problem_end = current_time;
 		}
 
 		/* write the host state change to the main log file */
@@ -1060,6 +1068,12 @@ static int handle_host_state(host *hst, int *alert_recorded)
 			*alert_recorded = NEBATTR_CHECK_ALERT;
 		}
 	}
+
+	/* initialize the last host state change times if necessary */
+	if (hst->last_state_change == (time_t)0)
+		hst->last_state_change = hst->last_check;
+	if (hst->last_hard_state_change == (time_t)0)
+		hst->last_hard_state_change = hst->last_check;
 
 	return OK;
 }
@@ -1169,6 +1183,8 @@ static void check_for_orphaned_hosts_eventhandler(struct nm_event_execution_prop
 
 				/* disable the executing flag */
 				temp_host->is_executing = FALSE;
+
+				temp_host->last_update = current_time;
 
 				/* schedule an immediate check of the host */
 				schedule_next_host_check(temp_host, 0, CHECK_OPTION_ORPHAN_CHECK);
