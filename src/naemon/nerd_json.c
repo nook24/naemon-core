@@ -16,7 +16,7 @@
 #endif
 
 static unsigned int chan_host_checks_json_id;
-//static unsigned int chan_service_checks_json_id;
+static unsigned int chan_service_checks_json_id;
 
 static int chan_host_checks_json(int cb, void *data)
 {
@@ -52,6 +52,40 @@ static int chan_host_checks_json(int cb, void *data)
     return 0;
 }
 
+static int chan_service_checks_json(int cb, void *data)
+{
+    json_object *servicecheck_object;
+    const char *json_string;
+    char *json_string_dub;
+
+    nebstruct_service_check_data *ds = (nebstruct_service_check_data *)data;
+
+    if (ds->type != NEBTYPE_SERVICECHECK_PROCESSED)
+        return 0;
+
+    if (nerd_channel_has_subscriptions(chan_service_checks_json_id) == 0)
+        return 0;
+
+    // Encode the current service check event as JSON object
+    servicecheck_object = nebstruct_encode_service_check_as_json(ds);
+
+    // Convert the JSON object to a string
+    json_string = json_object_to_json_string(servicecheck_object);
+
+    // Duplicate so we can free everything
+    json_string_dub = nm_strdup(json_string);
+
+    // Release resources
+    json_object_put(servicecheck_object);
+
+    // Send JSON through the query handler socket strlen()+1 to include the null terminator 
+    nerd_broadcast(chan_service_checks_json_id, (void *)json_string_dub, strlen(json_string_dub)+1);
+
+    free(json_string_dub);
+
+    return 0;
+}
+
 /* Add  JSON encoded channels into nerd if json-c lib is available */
 int nerd_init_json(void)
 {
@@ -61,9 +95,9 @@ int nerd_init_json(void)
     chan_host_checks_json_id = nerd_mkchan("hostchecks_json",
                                       "Host check results encoded as JSON",
                                       chan_host_checks_json, nebcallback_flag(NEBCALLBACK_HOST_CHECK_DATA));
-    /*chan_service_checks_json_id = nerd_mkchan("servicechecks_json",
-                                         "Service check results encoded as JSON",
-                                         chan_service_checks, nebcallback_flag(NEBCALLBACK_SERVICE_CHECK_DATA));
-*/
+    chan_service_checks_json_id = nerd_mkchan("servicechecks_json",
+                                      "Service check results encoded as JSON",
+                                      chan_service_checks_json, nebcallback_flag(NEBCALLBACK_SERVICE_CHECK_DATA));
+
     return 0;
 }

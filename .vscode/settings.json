@@ -1,5 +1,8 @@
 {
     "files.associations": {
         "globals.h": "c"
-    }
+    },
+    "cSpell.words": [
+        "Naemon"
+    ]
 }

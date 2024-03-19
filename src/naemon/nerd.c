@@ -405,9 +405,8 @@ int nerd_init(void)
 	chan_service_checks_id = nerd_mkchan("servicechecks",
 	                                     "Service check results",
 	                                     chan_service_checks, nebcallback_flag(NEBCALLBACK_SERVICE_CHECK_DATA));
-
 #ifdef HAVE_JSONC
-	// json-c is available - lets add some JSON encoeded services to nerd
+	// json-c is available - lets add some JSON encoded services to nerd
 	nerd_init_json();
 #else
 	// Handle the case where json-c is not available
