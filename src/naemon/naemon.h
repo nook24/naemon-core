@@ -29,6 +29,9 @@
 #include "nebmods.h"
 #include "nebmodules.h"
 #include "nebstructs.h"
+#ifdef HAVE_JSONC
+#include "nebstructs_json.h"
+#endif
 #include "nerd.h"
 #include "notifications.h"
 #include "objectlist.h"
