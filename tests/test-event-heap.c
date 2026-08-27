@@ -10,7 +10,7 @@ static void print_heap(struct timed_event_queue *q, size_t i) {
 	if(i >= q->count)
 		return;
 	if(i==0) printf("\n");
-	ev = q->queue[i];
+	ev = q->queue[i].ev;
 	printf("%3lu %3lu ", i, ev->pos);
 	for(depth = i; depth>0; depth = ((depth-1)>>1))
 		printf("  ");
@@ -34,11 +34,11 @@ static void verify_queue_heap(struct timed_event_queue *q)
 	for (i = 0; i < q->count; i++) {
 		child = i * 2 + 1;
 		if (child < q->count) {
-			_ck_assert_int(evheap_compare(q->queue[i], q->queue[child]), <=, 0);
+			_ck_assert_int(q->queue[i].key, <=, q->queue[child].key);
 		}
 		child = i * 2 + 2;
 		if (child < q->count) {
-			_ck_assert_int(evheap_compare(q->queue[i], q->queue[child]), <=, 0);
+			_ck_assert_int(q->queue[i].key, <=, q->queue[child].key);
 		}
 	}
 
@@ -181,7 +181,7 @@ START_TEST(event_heap_count_random_removal)
 		ck_assert_int_ne(q->count, 0);
 
 		/* Pick an event at random */
-		ev = q->queue[rand() % q->count];
+		ev = q->queue[rand() % q->count].ev;
 		evheap_remove(q, ev);
 		free(ev);
 

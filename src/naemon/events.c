@@ -2,6 +2,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include "events.h"
 #include "logging.h"
 #include "nm_alloc.h"
@@ -17,11 +18,27 @@ struct timed_event {
 	void *user_data;
 };
 
+/*
+ * Heap entries carry the sort key inline. Sifting an event through a heap of
+ * ~100k entries otherwise dereferences two timed_event structs per level, all
+ * of them in different cache lines, which made heap maintenance one of the
+ * more expensive parts of the event loop.
+ */
+struct evheap_entry {
+	int64_t key; /* event_time in nanoseconds, on EVENT_CLOCK_ID's timescale */
+	struct timed_event *ev;
+};
+
 struct timed_event_queue {
-	struct timed_event **queue;
+	struct evheap_entry *queue;
 	size_t count;
 	size_t size;
 };
+
+static inline int64_t evheap_key(const struct timespec *ts)
+{
+	return (int64_t)ts->tv_sec * 1000000000LL + (int64_t)ts->tv_nsec;
+}
 
 struct timed_event_queue *event_queue = NULL; /* our scheduling queue */
 iobroker_set *nagios_iobs = NULL;
@@ -64,19 +81,6 @@ overflow:
 /************************** HEAP METHODS **************************/
 /******************************************************************/
 
-static inline int evheap_compare(struct timed_event *eva, struct timed_event *evb)
-{
-	if (eva->event_time.tv_sec < evb->event_time.tv_sec)
-		return -1;
-	if (eva->event_time.tv_sec > evb->event_time.tv_sec)
-		return 1;
-	if (eva->event_time.tv_nsec < evb->event_time.tv_nsec)
-		return -1;
-	if (eva->event_time.tv_nsec > evb->event_time.tv_nsec)
-		return 1;
-	return 0;
-}
-
 static void evheap_set_size(struct timed_event_queue *q, size_t new_size)
 {
 	size_t size = q->size;
@@ -94,33 +98,29 @@ static void evheap_set_size(struct timed_event_queue *q, size_t new_size)
 
 	if (size != q->size) {
 		q->size = size;
-		q->queue = nm_realloc(q->queue, q->size * sizeof(struct timed_event *));
+		q->queue = nm_realloc(q->queue, q->size * sizeof(struct evheap_entry));
 	}
 }
 
 static int evheap_cond_swap(struct timed_event_queue *q, size_t idx_low, size_t idx_high)
 {
-	struct timed_event *ev_low, *ev_high;
+	struct evheap_entry tmp;
 	g_return_val_if_fail(q != NULL, 0);
 
 	if (idx_low == idx_high)
 		return 0;
 
-	/* Assume we need to swap */
-	ev_low = q->queue[idx_high];
-	ev_high = q->queue[idx_low];
-
-	/* If assumption isn't correct, bail out */
-	if (evheap_compare(ev_high, ev_low) < 0)
+	/* If the entries are already in order, bail out */
+	if (q->queue[idx_low].key < q->queue[idx_high].key)
 		return 0;
 
-	/* Assumption were correct, save */
-	q->queue[idx_low] = ev_low;
-	q->queue[idx_high] = ev_high;
+	tmp = q->queue[idx_low];
+	q->queue[idx_low] = q->queue[idx_high];
+	q->queue[idx_high] = tmp;
 
 	/* Update positions */
-	ev_low->pos = idx_low;
-	ev_high->pos = idx_high;
+	q->queue[idx_low].ev->pos = idx_low;
+	q->queue[idx_high].ev->pos = idx_high;
 
 	return 1;
 }
@@ -143,7 +143,7 @@ static void evheap_bubble_down(struct timed_event_queue *q, size_t idx)
 	g_return_if_fail(q != NULL);
 	while ((child = (idx << 1) + 1) < q->count) {
 		if (child + 1 < q->count)
-			if (evheap_compare(q->queue[child], q->queue[child + 1]) > 0)
+			if (q->queue[child].key > q->queue[child + 1].key)
 				child++;
 		if (!evheap_cond_swap(q, idx, child))
 			break;
@@ -155,7 +155,7 @@ static struct timed_event *evheap_head(struct timed_event_queue *q)
 {
 	if (!q || q->count == 0)
 		return NULL;
-	return q->queue[0];
+	return q->queue[0].ev;
 }
 
 static void evheap_remove(struct timed_event_queue *q, struct timed_event *ev)
@@ -163,7 +163,7 @@ static void evheap_remove(struct timed_event_queue *q, struct timed_event *ev)
 	g_return_if_fail(q != NULL);
 	g_return_if_fail(ev != NULL);
 	q->queue[ev->pos] = q->queue[q->count - 1];
-	q->queue[ev->pos]->pos = ev->pos;
+	q->queue[ev->pos].ev->pos = ev->pos;
 
 	q->count--;
 	evheap_set_size(q, q->count);
@@ -181,7 +181,8 @@ static void evheap_add(struct timed_event_queue *q, struct timed_event *ev)
 	g_return_if_fail(ev != NULL);
 	evheap_set_size(q, q->count + 1);
 	ev->pos = q->count;
-	q->queue[ev->pos] = ev;
+	q->queue[ev->pos].ev = ev;
+	q->queue[ev->pos].key = evheap_key(&ev->event_time);
 	q->count++;
 
 	evheap_bubble_up(q, ev->pos);
@@ -194,7 +195,7 @@ static struct timed_event_queue *evheap_create(void)
 
 	/* Since count is 0, the queue will shirnk at first insert anyway. No need to start with a bigger queue */
 	q->size = 1;
-	q->queue = nm_calloc(q->size, sizeof(struct timed_event *));
+	q->queue = nm_calloc(q->size, sizeof(struct evheap_entry));
 
 	q->count = 0;
 	return q;
