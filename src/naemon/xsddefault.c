@@ -11,6 +11,10 @@
 #include "globals.h"
 #include "nm_alloc.h"
 #include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <errno.h>
 
 int buffer_stats[1][3];
 int program_stats[MAX_CHECK_STATS_TYPES][3];
@@ -68,6 +72,184 @@ int xsddefault_cleanup_status_data(int delete_status_data)
 /******************************************************************/
 
 /* write all status data to file */
+/*
+ * Simple append buffer used for writing status data. Formatting the status
+ * file with fprintf() showed up as ~50% of the event loop's CPU time on
+ * installations with 100k services, almost all of it inside the printf
+ * format-string interpreter. Emitting the (overwhelmingly integer and string)
+ * fields directly into a large buffer avoids that entirely.
+ */
+struct statusbuf {
+	char *buf;
+	size_t len;
+	size_t cap;
+	int fd;
+	int error;
+};
+
+#define STATUSBUF_SIZE (1024 * 1024)
+
+static void sb_flush(struct statusbuf *sb)
+{
+	size_t off = 0;
+
+	while (off < sb->len) {
+		ssize_t n = write(sb->fd, sb->buf + off, sb->len - off);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			sb->error = 1;
+			break;
+		}
+		off += (size_t)n;
+	}
+	sb->len = 0;
+}
+
+/* make sure at least n bytes are available in the buffer */
+static inline void sb_reserve(struct statusbuf *sb, size_t n)
+{
+	if (sb->len + n > sb->cap)
+		sb_flush(sb);
+	if (n > sb->cap) {
+		/* single field larger than the buffer, grow to fit */
+		sb->cap = n * 2;
+		sb->buf = nm_realloc(sb->buf, sb->cap);
+	}
+}
+
+static inline void sb_mem(struct statusbuf *sb, const char *s, size_t n)
+{
+	sb_reserve(sb, n);
+	memcpy(sb->buf + sb->len, s, n);
+	sb->len += n;
+}
+
+#define sb_lit(sb, s) sb_mem((sb), (s), sizeof(s) - 1)
+
+static inline void sb_str(struct statusbuf *sb, const char *s)
+{
+	if (s != NULL)
+		sb_mem(sb, s, strlen(s));
+}
+
+/* append an unsigned value, no padding */
+static inline void sb_uint(struct statusbuf *sb, unsigned long long v)
+{
+	char tmp[24];
+	int i = (int)sizeof(tmp);
+
+	do {
+		tmp[--i] = (char)('0' + (v % 10));
+		v /= 10;
+	} while (v);
+	sb_mem(sb, tmp + i, sizeof(tmp) - (size_t)i);
+}
+
+static inline void sb_int(struct statusbuf *sb, long long v)
+{
+	if (v < 0) {
+		sb_lit(sb, "-");
+		sb_uint(sb, (unsigned long long) - (v + 1) + 1ULL);
+	} else {
+		sb_uint(sb, (unsigned long long)v);
+	}
+}
+
+/*
+ * Doubles are still formatted by snprintf() -- reimplementing printf's
+ * rounding would risk changing the file format. Instead the results are
+ * memoized: the handful of double fields per object (check_interval,
+ * retry_interval, execution time, latency, percent_state_change) repeat the
+ * same few values across the whole object list, so a small direct-mapped
+ * cache keyed on the bit pattern removes almost all of the printf calls
+ * while producing exactly the bytes snprintf would have produced.
+ */
+#define SB_DBL_CACHE_SIZE 64
+struct sb_dbl_cache_entry {
+	uint64_t bits;
+	const char *fmt;
+	unsigned char len;
+	char text[31];
+};
+static struct sb_dbl_cache_entry sb_dbl_cache[SB_DBL_CACHE_SIZE];
+
+static void sb_dbl(struct statusbuf *sb, const char *fmt, double v)
+{
+	char tmp[64];
+	uint64_t bits;
+	unsigned idx;
+	struct sb_dbl_cache_entry *e;
+	int n;
+
+	memcpy(&bits, &v, sizeof(bits));
+	idx = (unsigned)((bits ^ (bits >> 32) ^ (uintptr_t)fmt) % SB_DBL_CACHE_SIZE);
+	e = &sb_dbl_cache[idx];
+	if (e->len && e->bits == bits && e->fmt == fmt) {
+		sb_mem(sb, e->text, e->len);
+		return;
+	}
+
+	n = snprintf(tmp, sizeof(tmp), fmt, v);
+	if (n < 0)
+		return;
+	if ((size_t)n >= sizeof(tmp))
+		n = (int)sizeof(tmp) - 1;
+	sb_mem(sb, tmp, (size_t)n);
+
+	/* only cache what fits, longer results are rare and not worth it */
+	if ((size_t)n < sizeof(e->text)) {
+		e->bits = bits;
+		e->fmt = fmt;
+		e->len = (unsigned char)n;
+		memcpy(e->text, tmp, (size_t)n);
+	}
+}
+
+/* "\tkey=value\n" helpers -- key is always a string literal */
+#define sb_kv_str(sb, key, val)   do { sb_lit((sb), "\t" key "="); sb_str((sb), (val)); sb_lit((sb), "\n"); } while (0)
+#define sb_kv_int(sb, key, val)   do { sb_lit((sb), "\t" key "="); sb_int((sb), (long long)(val)); sb_lit((sb), "\n"); } while (0)
+#define sb_kv_uint(sb, key, val)  do { sb_lit((sb), "\t" key "="); sb_uint((sb), (unsigned long long)(val)); sb_lit((sb), "\n"); } while (0)
+#define sb_kv_dbl(sb, key, fmt, val) do { sb_lit((sb), "\t" key "="); sb_dbl((sb), (fmt), (double)(val)); sb_lit((sb), "\n"); } while (0)
+
+/* generic fallback for the few rare/complex lines */
+static void sb_printf(struct statusbuf *sb, const char *fmt, ...)
+{
+	char tmp[512];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	if ((size_t)n < sizeof(tmp)) {
+		sb_mem(sb, tmp, (size_t)n);
+		return;
+	}
+	{
+		char *big = nm_malloc((size_t)n + 1);
+		va_start(ap, fmt);
+		vsnprintf(big, (size_t)n + 1, fmt, ap);
+		va_end(ap);
+		sb_mem(sb, big, (size_t)n);
+		free(big);
+	}
+}
+
+/* "\t_NAME=MODIFIED;VALUE\n" */
+static void sb_customvar(struct statusbuf *sb, const customvariablesmember *cv)
+{
+	sb_lit(sb, "\t_");
+	sb_str(sb, cv->variable_name);
+	sb_lit(sb, "=");
+	sb_int(sb, cv->has_been_modified);
+	sb_lit(sb, ";");
+	sb_str(sb, cv->variable_value);
+	sb_lit(sb, "\n");
+}
+
 int xsddefault_save_status_data(void)
 {
 	char *tmp_log = NULL;
@@ -81,7 +263,7 @@ int xsddefault_save_status_data(void)
 	scheduled_downtime *temp_downtime = NULL;
 	time_t current_time;
 	int fd = 0;
-	FILE *fp = NULL;
+	struct statusbuf sb;
 	int result = OK;
 
 	/* users may not want us to write status data */
@@ -103,239 +285,232 @@ int xsddefault_save_status_data(void)
 
 		return ERROR;
 	}
-	fp = (FILE *)fdopen(fd, "w");
-	if (fp == NULL) {
 
-		close(fd);
-		unlink(tmp_log);
-
-		/* log an error */
-		nm_log(NSLOG_RUNTIME_ERROR, "Error: Unable to open temp file '%s' for writing status data: %s\n", tmp_log, strerror(errno));
-
-		nm_free(tmp_log);
-
-		return ERROR;
-	}
+	sb.buf = nm_malloc(STATUSBUF_SIZE);
+	sb.cap = STATUSBUF_SIZE;
+	sb.len = 0;
+	sb.fd = fd;
+	sb.error = 0;
 
 	/* generate check statistics */
 	generate_check_stats();
 
 	/* write version info to status file */
-	fprintf(fp, "########################################\n");
-	fprintf(fp, "#          NAGIOS STATUS FILE\n");
-	fprintf(fp, "#\n");
-	fprintf(fp, "# THIS FILE IS AUTOMATICALLY GENERATED\n");
-	fprintf(fp, "# BY NAGIOS.  DO NOT MODIFY THIS FILE!\n");
-	fprintf(fp, "########################################\n\n");
+	sb_lit(&sb, "########################################\n");
+	sb_lit(&sb, "#          NAGIOS STATUS FILE\n");
+	sb_lit(&sb, "#\n");
+	sb_lit(&sb, "# THIS FILE IS AUTOMATICALLY GENERATED\n");
+	sb_lit(&sb, "# BY NAGIOS.  DO NOT MODIFY THIS FILE!\n");
+	sb_lit(&sb, "########################################\n\n");
 
 	time(&current_time);
 
 	/* write file info */
-	fprintf(fp, "info {\n");
-	fprintf(fp, "\tcreated=%lu\n", current_time);
-	fprintf(fp, "\tversion=" VERSION "\n");
-	fprintf(fp, "\t}\n\n");
+	sb_lit(&sb, "info {\n");
+	sb_kv_uint(&sb, "created", current_time);
+	sb_lit(&sb, "\tversion=" VERSION "\n");
+	sb_lit(&sb, "\t}\n\n");
 
 	/* save program status data */
-	fprintf(fp, "programstatus {\n");
-	fprintf(fp, "\tmodified_host_attributes=%lu\n", modified_host_process_attributes);
-	fprintf(fp, "\tmodified_service_attributes=%lu\n", modified_service_process_attributes);
-	fprintf(fp, "\tnagios_pid=%d\n", nagios_pid);
-	fprintf(fp, "\tdaemon_mode=%d\n", daemon_mode);
-	fprintf(fp, "\tprogram_start=%lu\n", program_start);
-	fprintf(fp, "\tlast_log_rotation=%lu\n", last_log_rotation);
-	fprintf(fp, "\tenable_notifications=%d\n", enable_notifications);
-	fprintf(fp, "\tactive_service_checks_enabled=%d\n", execute_service_checks);
-	fprintf(fp, "\tpassive_service_checks_enabled=%d\n", accept_passive_service_checks);
-	fprintf(fp, "\tactive_host_checks_enabled=%d\n", execute_host_checks);
-	fprintf(fp, "\tpassive_host_checks_enabled=%d\n", accept_passive_host_checks);
-	fprintf(fp, "\tenable_event_handlers=%d\n", enable_event_handlers);
-	fprintf(fp, "\tobsess_over_services=%d\n", obsess_over_services);
-	fprintf(fp, "\tobsess_over_hosts=%d\n", obsess_over_hosts);
-	fprintf(fp, "\tcheck_service_freshness=%d\n", check_service_freshness);
-	fprintf(fp, "\tcheck_host_freshness=%d\n", check_host_freshness);
-	fprintf(fp, "\tenable_flap_detection=%d\n", enable_flap_detection);
-	fprintf(fp, "\tprocess_performance_data=%d\n", process_performance_data);
-	fprintf(fp, "\tglobal_host_event_handler=%s\n", (global_host_event_handler == NULL) ? "" : global_host_event_handler);
-	fprintf(fp, "\tglobal_service_event_handler=%s\n", (global_service_event_handler == NULL) ? "" : global_service_event_handler);
-	fprintf(fp, "\tglobal_host_notification_handler=%s\n", (global_host_notification_handler == NULL) ? "" : global_host_notification_handler);
-	fprintf(fp, "\tglobal_service_notification_handler=%s\n", (global_service_notification_handler == NULL) ? "" : global_service_notification_handler);
-	fprintf(fp, "\tnext_comment_id=%lu\n", next_comment_id);
-	fprintf(fp, "\tnext_downtime_id=%lu\n", next_downtime_id);
-	fprintf(fp, "\tnext_event_id=%lu\n", next_event_id);
-	fprintf(fp, "\tactive_scheduled_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tactive_ondemand_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tpassive_host_check_stats=%d,%d,%d\n", check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[0], check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[1], check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tactive_scheduled_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tactive_ondemand_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tpassive_service_check_stats=%d,%d,%d\n", check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tcached_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tcached_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\texternal_command_stats=%d,%d,%d\n", check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[0], check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[1], check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[2]);
+	sb_lit(&sb, "programstatus {\n");
+	sb_kv_uint(&sb, "modified_host_attributes", modified_host_process_attributes);
+	sb_kv_uint(&sb, "modified_service_attributes", modified_service_process_attributes);
+	sb_kv_int(&sb, "nagios_pid", nagios_pid);
+	sb_kv_int(&sb, "daemon_mode", daemon_mode);
+	sb_kv_uint(&sb, "program_start", program_start);
+	sb_kv_uint(&sb, "last_log_rotation", last_log_rotation);
+	sb_kv_int(&sb, "enable_notifications", enable_notifications);
+	sb_kv_int(&sb, "active_service_checks_enabled", execute_service_checks);
+	sb_kv_int(&sb, "passive_service_checks_enabled", accept_passive_service_checks);
+	sb_kv_int(&sb, "active_host_checks_enabled", execute_host_checks);
+	sb_kv_int(&sb, "passive_host_checks_enabled", accept_passive_host_checks);
+	sb_kv_int(&sb, "enable_event_handlers", enable_event_handlers);
+	sb_kv_int(&sb, "obsess_over_services", obsess_over_services);
+	sb_kv_int(&sb, "obsess_over_hosts", obsess_over_hosts);
+	sb_kv_int(&sb, "check_service_freshness", check_service_freshness);
+	sb_kv_int(&sb, "check_host_freshness", check_host_freshness);
+	sb_kv_int(&sb, "enable_flap_detection", enable_flap_detection);
+	sb_kv_int(&sb, "process_performance_data", process_performance_data);
+	sb_kv_str(&sb, "global_host_event_handler", global_host_event_handler);
+	sb_kv_str(&sb, "global_service_event_handler", global_service_event_handler);
+	sb_kv_str(&sb, "global_host_notification_handler", global_host_notification_handler);
+	sb_kv_str(&sb, "global_service_notification_handler", global_service_notification_handler);
+	sb_kv_uint(&sb, "next_comment_id", next_comment_id);
+	sb_kv_uint(&sb, "next_downtime_id", next_downtime_id);
+	sb_kv_uint(&sb, "next_event_id", next_event_id);
+	sb_printf(&sb, "\tactive_scheduled_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_SCHEDULED_HOST_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tactive_ondemand_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_ONDEMAND_HOST_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tpassive_host_check_stats=%d,%d,%d\n", check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[0], check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[1], check_statistics[PASSIVE_HOST_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tactive_scheduled_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_SCHEDULED_SERVICE_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tactive_ondemand_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_ONDEMAND_SERVICE_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tpassive_service_check_stats=%d,%d,%d\n", check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[PASSIVE_SERVICE_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tcached_host_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_CACHED_HOST_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tcached_service_check_stats=%d,%d,%d\n", check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[0], check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[1], check_statistics[ACTIVE_CACHED_SERVICE_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\texternal_command_stats=%d,%d,%d\n", check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[0], check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[1], check_statistics[EXTERNAL_COMMAND_STATS].minute_stats[2]);
 
-	fprintf(fp, "\tparallel_host_check_stats=%d,%d,%d\n", check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[0], check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[1], check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\tserial_host_check_stats=%d,%d,%d\n", check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[0], check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[1], check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[2]);
-	fprintf(fp, "\t}\n\n");
+	sb_printf(&sb, "\tparallel_host_check_stats=%d,%d,%d\n", check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[0], check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[1], check_statistics[PARALLEL_HOST_CHECK_STATS].minute_stats[2]);
+	sb_printf(&sb, "\tserial_host_check_stats=%d,%d,%d\n", check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[0], check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[1], check_statistics[SERIAL_HOST_CHECK_STATS].minute_stats[2]);
+	sb_lit(&sb, "\t}\n\n");
 
 
 	/* save host status data */
 	for (temp_host = host_list; temp_host != NULL; temp_host = temp_host->next) {
 
-		fprintf(fp, "hoststatus {\n");
-		fprintf(fp, "\thost_name=%s\n", temp_host->name);
+		sb_lit(&sb, "hoststatus {\n");
+		sb_kv_str(&sb, "host_name", temp_host->name);
 
-		fprintf(fp, "\tmodified_attributes=%lu\n", temp_host->modified_attributes);
-		fprintf(fp, "\tcheck_command=%s\n", (temp_host->check_command == NULL) ? "" : temp_host->check_command);
-		fprintf(fp, "\tcheck_period=%s\n", (temp_host->check_period == NULL) ? "" : temp_host->check_period);
-		fprintf(fp, "\tnotification_period=%s\n", (temp_host->notification_period == NULL) ? "" : temp_host->notification_period);
-		fprintf(fp, "\tcheck_interval=%f\n", temp_host->check_interval);
-		fprintf(fp, "\tretry_interval=%f\n", temp_host->retry_interval);
-		fprintf(fp, "\tevent_handler=%s\n", (temp_host->event_handler == NULL) ? "" : temp_host->event_handler);
+		sb_kv_uint(&sb, "modified_attributes", temp_host->modified_attributes);
+		sb_kv_str(&sb, "check_command", temp_host->check_command);
+		sb_kv_str(&sb, "check_period", temp_host->check_period);
+		sb_kv_str(&sb, "notification_period", temp_host->notification_period);
+		sb_kv_dbl(&sb, "check_interval", "%f", temp_host->check_interval);
+		sb_kv_dbl(&sb, "retry_interval", "%f", temp_host->retry_interval);
+		sb_kv_str(&sb, "event_handler", temp_host->event_handler);
 
-		fprintf(fp, "\thas_been_checked=%d\n", temp_host->has_been_checked);
-		fprintf(fp, "\tcheck_execution_time=%.3f\n", temp_host->execution_time);
-		fprintf(fp, "\tcheck_latency=%.3f\n", temp_host->latency);
-		fprintf(fp, "\tcheck_type=%d\n", temp_host->check_type);
-		fprintf(fp, "\tcurrent_state=%d\n", temp_host->current_state);
-		fprintf(fp, "\tlast_hard_state=%d\n", temp_host->last_hard_state);
-		fprintf(fp, "\tlast_event_id=%lu\n", temp_host->last_event_id);
-		fprintf(fp, "\tcurrent_event_id=%lu\n", temp_host->current_event_id);
-		fprintf(fp, "\tcurrent_problem_id=%s\n", (temp_host->current_problem_id == NULL) ? "" : temp_host->current_problem_id);
-		fprintf(fp, "\tlast_problem_id=%s\n", (temp_host->last_problem_id == NULL) ? "" : temp_host->last_problem_id);
-		fprintf(fp, "\tproblem_start=%lu\n", temp_host->problem_start);
-		fprintf(fp, "\tproblem_end=%lu\n", temp_host->problem_end);
-		fprintf(fp, "\tplugin_output=%s\n", (temp_host->plugin_output == NULL) ? "" : temp_host->plugin_output);
-		fprintf(fp, "\tlong_plugin_output=%s\n", (temp_host->long_plugin_output == NULL) ? "" : temp_host->long_plugin_output);
-		fprintf(fp, "\tperformance_data=%s\n", (temp_host->perf_data == NULL) ? "" : temp_host->perf_data);
-		fprintf(fp, "\tlast_check=%lu\n", temp_host->last_check);
-		fprintf(fp, "\tnext_check=%lu\n", temp_host->next_check);
-		fprintf(fp, "\tcheck_options=%d\n", temp_host->check_options);
-		fprintf(fp, "\tcurrent_attempt=%d\n", temp_host->current_attempt);
-		fprintf(fp, "\tmax_attempts=%d\n", temp_host->max_attempts);
-		fprintf(fp, "\tstate_type=%d\n", temp_host->state_type);
-		fprintf(fp, "\tlast_state_change=%lu\n", temp_host->last_state_change);
-		fprintf(fp, "\tlast_hard_state_change=%lu\n", temp_host->last_hard_state_change);
-		fprintf(fp, "\tlast_time_up=%lu\n", temp_host->last_time_up);
-		fprintf(fp, "\tlast_time_down=%lu\n", temp_host->last_time_down);
-		fprintf(fp, "\tlast_time_unreachable=%lu\n", temp_host->last_time_unreachable);
-		fprintf(fp, "\tlast_notification=%lu\n", temp_host->last_notification);
-		fprintf(fp, "\tnext_notification=%lu\n", temp_host->next_notification);
-		fprintf(fp, "\tno_more_notifications=%d\n", temp_host->no_more_notifications);
-		fprintf(fp, "\tcurrent_notification_number=%d\n", temp_host->current_notification_number);
-		fprintf(fp, "\tcurrent_notification_id=%s\n", (temp_host->current_notification_id == NULL) ? "" : temp_host->current_notification_id);
-		fprintf(fp, "\tnotifications_enabled=%d\n", temp_host->notifications_enabled);
-		fprintf(fp, "\tproblem_has_been_acknowledged=%d\n", temp_host->problem_has_been_acknowledged);
-		fprintf(fp, "\tacknowledgement_type=%d\n", temp_host->acknowledgement_type);
-		fprintf(fp, "\tacknowledgement_end_time=%lu\n", temp_host->acknowledgement_end_time);
-		fprintf(fp, "\tactive_checks_enabled=%d\n", temp_host->checks_enabled);
-		fprintf(fp, "\tpassive_checks_enabled=%d\n", temp_host->accept_passive_checks);
-		fprintf(fp, "\tevent_handler_enabled=%d\n", temp_host->event_handler_enabled);
-		fprintf(fp, "\tflap_detection_enabled=%d\n", temp_host->flap_detection_enabled);
-		fprintf(fp, "\tprocess_performance_data=%d\n", temp_host->process_performance_data);
-		fprintf(fp, "\tobsess=%d\n", temp_host->obsess);
-		fprintf(fp, "\tis_flapping=%d\n", temp_host->is_flapping);
-		fprintf(fp, "\tpercent_state_change=%.2f\n", temp_host->percent_state_change);
-		fprintf(fp, "\tscheduled_downtime_depth=%d\n", temp_host->scheduled_downtime_depth);
-		fprintf(fp, "\tlast_update=%s\n", tv_str(&temp_host->last_update));
+		sb_kv_int(&sb, "has_been_checked", temp_host->has_been_checked);
+		sb_kv_dbl(&sb, "check_execution_time", "%.3f", temp_host->execution_time);
+		sb_kv_dbl(&sb, "check_latency", "%.3f", temp_host->latency);
+		sb_kv_int(&sb, "check_type", temp_host->check_type);
+		sb_kv_int(&sb, "current_state", temp_host->current_state);
+		sb_kv_int(&sb, "last_hard_state", temp_host->last_hard_state);
+		sb_kv_uint(&sb, "last_event_id", temp_host->last_event_id);
+		sb_kv_uint(&sb, "current_event_id", temp_host->current_event_id);
+		sb_kv_str(&sb, "current_problem_id", temp_host->current_problem_id);
+		sb_kv_str(&sb, "last_problem_id", temp_host->last_problem_id);
+		sb_kv_uint(&sb, "problem_start", temp_host->problem_start);
+		sb_kv_uint(&sb, "problem_end", temp_host->problem_end);
+		sb_kv_str(&sb, "plugin_output", temp_host->plugin_output);
+		sb_kv_str(&sb, "long_plugin_output", temp_host->long_plugin_output);
+		sb_kv_str(&sb, "performance_data", temp_host->perf_data);
+		sb_kv_uint(&sb, "last_check", temp_host->last_check);
+		sb_kv_uint(&sb, "next_check", temp_host->next_check);
+		sb_kv_int(&sb, "check_options", temp_host->check_options);
+		sb_kv_int(&sb, "current_attempt", temp_host->current_attempt);
+		sb_kv_int(&sb, "max_attempts", temp_host->max_attempts);
+		sb_kv_int(&sb, "state_type", temp_host->state_type);
+		sb_kv_uint(&sb, "last_state_change", temp_host->last_state_change);
+		sb_kv_uint(&sb, "last_hard_state_change", temp_host->last_hard_state_change);
+		sb_kv_uint(&sb, "last_time_up", temp_host->last_time_up);
+		sb_kv_uint(&sb, "last_time_down", temp_host->last_time_down);
+		sb_kv_uint(&sb, "last_time_unreachable", temp_host->last_time_unreachable);
+		sb_kv_uint(&sb, "last_notification", temp_host->last_notification);
+		sb_kv_uint(&sb, "next_notification", temp_host->next_notification);
+		sb_kv_int(&sb, "no_more_notifications", temp_host->no_more_notifications);
+		sb_kv_int(&sb, "current_notification_number", temp_host->current_notification_number);
+		sb_kv_str(&sb, "current_notification_id", temp_host->current_notification_id);
+		sb_kv_int(&sb, "notifications_enabled", temp_host->notifications_enabled);
+		sb_kv_int(&sb, "problem_has_been_acknowledged", temp_host->problem_has_been_acknowledged);
+		sb_kv_int(&sb, "acknowledgement_type", temp_host->acknowledgement_type);
+		sb_kv_uint(&sb, "acknowledgement_end_time", temp_host->acknowledgement_end_time);
+		sb_kv_int(&sb, "active_checks_enabled", temp_host->checks_enabled);
+		sb_kv_int(&sb, "passive_checks_enabled", temp_host->accept_passive_checks);
+		sb_kv_int(&sb, "event_handler_enabled", temp_host->event_handler_enabled);
+		sb_kv_int(&sb, "flap_detection_enabled", temp_host->flap_detection_enabled);
+		sb_kv_int(&sb, "process_performance_data", temp_host->process_performance_data);
+		sb_kv_int(&sb, "obsess", temp_host->obsess);
+		sb_kv_int(&sb, "is_flapping", temp_host->is_flapping);
+		sb_kv_dbl(&sb, "percent_state_change", "%.2f", temp_host->percent_state_change);
+		sb_kv_int(&sb, "scheduled_downtime_depth", temp_host->scheduled_downtime_depth);
+		sb_kv_str(&sb, "last_update", tv_str(&temp_host->last_update));
 		/* custom variables */
 		for (temp_customvariablesmember = temp_host->custom_variables; temp_customvariablesmember != NULL; temp_customvariablesmember = temp_customvariablesmember->next) {
 			if (temp_customvariablesmember->variable_name)
-				fprintf(fp, "\t_%s=%d;%s\n", temp_customvariablesmember->variable_name, temp_customvariablesmember->has_been_modified, (temp_customvariablesmember->variable_value == NULL) ? "" : temp_customvariablesmember->variable_value);
+				sb_customvar(&sb, temp_customvariablesmember);
 		}
-		fprintf(fp, "\t}\n\n");
+		sb_lit(&sb, "\t}\n\n");
 	}
 
 	/* save service status data */
 	for (temp_service = service_list; temp_service != NULL; temp_service = temp_service->next) {
 
-		fprintf(fp, "servicestatus {\n");
-		fprintf(fp, "\thost_name=%s\n", temp_service->host_name);
+		sb_lit(&sb, "servicestatus {\n");
+		sb_kv_str(&sb, "host_name", temp_service->host_name);
 
-		fprintf(fp, "\tservice_description=%s\n", temp_service->description);
-		fprintf(fp, "\tmodified_attributes=%lu\n", temp_service->modified_attributes);
-		fprintf(fp, "\tcheck_command=%s\n", (temp_service->check_command == NULL) ? "" : temp_service->check_command);
-		fprintf(fp, "\tcheck_period=%s\n", (temp_service->check_period == NULL) ? "" : temp_service->check_period);
-		fprintf(fp, "\tnotification_period=%s\n", (temp_service->notification_period == NULL) ? "" : temp_service->notification_period);
-		fprintf(fp, "\tcheck_interval=%f\n", temp_service->check_interval);
-		fprintf(fp, "\tretry_interval=%f\n", temp_service->retry_interval);
-		fprintf(fp, "\tevent_handler=%s\n", (temp_service->event_handler == NULL) ? "" : temp_service->event_handler);
+		sb_kv_str(&sb, "service_description", temp_service->description);
+		sb_kv_uint(&sb, "modified_attributes", temp_service->modified_attributes);
+		sb_kv_str(&sb, "check_command", temp_service->check_command);
+		sb_kv_str(&sb, "check_period", temp_service->check_period);
+		sb_kv_str(&sb, "notification_period", temp_service->notification_period);
+		sb_kv_dbl(&sb, "check_interval", "%f", temp_service->check_interval);
+		sb_kv_dbl(&sb, "retry_interval", "%f", temp_service->retry_interval);
+		sb_kv_str(&sb, "event_handler", temp_service->event_handler);
 
-		fprintf(fp, "\thas_been_checked=%d\n", temp_service->has_been_checked);
-		fprintf(fp, "\tcheck_execution_time=%.3f\n", temp_service->execution_time);
-		fprintf(fp, "\tcheck_latency=%.3f\n", temp_service->latency);
-		fprintf(fp, "\tcheck_type=%d\n", temp_service->check_type);
-		fprintf(fp, "\tcurrent_state=%d\n", temp_service->current_state);
-		fprintf(fp, "\tlast_hard_state=%d\n", temp_service->last_hard_state);
-		fprintf(fp, "\tlast_event_id=%lu\n", temp_service->last_event_id);
-		fprintf(fp, "\tcurrent_event_id=%lu\n", temp_service->current_event_id);
-		fprintf(fp, "\tcurrent_problem_id=%s\n", (temp_service->current_problem_id == NULL) ? "" : temp_service->current_problem_id);
-		fprintf(fp, "\tlast_problem_id=%s\n", (temp_service->last_problem_id == NULL) ? "" : temp_service->last_problem_id);
-		fprintf(fp, "\tproblem_start=%lu\n", temp_service->problem_start);
-		fprintf(fp, "\tproblem_end=%lu\n", temp_service->problem_end);
-		fprintf(fp, "\tcurrent_attempt=%d\n", temp_service->current_attempt);
-		fprintf(fp, "\tmax_attempts=%d\n", temp_service->max_attempts);
-		fprintf(fp, "\tstate_type=%d\n", temp_service->state_type);
-		fprintf(fp, "\tlast_state_change=%lu\n", temp_service->last_state_change);
-		fprintf(fp, "\tlast_hard_state_change=%lu\n", temp_service->last_hard_state_change);
-		fprintf(fp, "\tlast_time_ok=%lu\n", temp_service->last_time_ok);
-		fprintf(fp, "\tlast_time_warning=%lu\n", temp_service->last_time_warning);
-		fprintf(fp, "\tlast_time_unknown=%lu\n", temp_service->last_time_unknown);
-		fprintf(fp, "\tlast_time_critical=%lu\n", temp_service->last_time_critical);
-		fprintf(fp, "\tplugin_output=%s\n", (temp_service->plugin_output == NULL) ? "" : temp_service->plugin_output);
-		fprintf(fp, "\tlong_plugin_output=%s\n", (temp_service->long_plugin_output == NULL) ? "" : temp_service->long_plugin_output);
-		fprintf(fp, "\tperformance_data=%s\n", (temp_service->perf_data == NULL) ? "" : temp_service->perf_data);
-		fprintf(fp, "\tlast_check=%lu\n", temp_service->last_check);
-		fprintf(fp, "\tnext_check=%lu\n", temp_service->next_check);
-		fprintf(fp, "\tcheck_options=%d\n", temp_service->check_options);
-		fprintf(fp, "\tcurrent_notification_number=%d\n", temp_service->current_notification_number);
-		fprintf(fp, "\tcurrent_notification_id=%s\n", (temp_service->current_notification_id == NULL) ? "" : temp_service->current_notification_id);
-		fprintf(fp, "\tlast_notification=%lu\n", temp_service->last_notification);
-		fprintf(fp, "\tnext_notification=%lu\n", temp_service->next_notification);
-		fprintf(fp, "\tno_more_notifications=%d\n", temp_service->no_more_notifications);
-		fprintf(fp, "\tnotifications_enabled=%d\n", temp_service->notifications_enabled);
-		fprintf(fp, "\tactive_checks_enabled=%d\n", temp_service->checks_enabled);
-		fprintf(fp, "\tpassive_checks_enabled=%d\n", temp_service->accept_passive_checks);
-		fprintf(fp, "\tevent_handler_enabled=%d\n", temp_service->event_handler_enabled);
-		fprintf(fp, "\tproblem_has_been_acknowledged=%d\n", temp_service->problem_has_been_acknowledged);
-		fprintf(fp, "\tacknowledgement_type=%d\n", temp_service->acknowledgement_type);
-		fprintf(fp, "\tacknowledgement_end_time=%lu\n", temp_service->acknowledgement_end_time);
-		fprintf(fp, "\tflap_detection_enabled=%d\n", temp_service->flap_detection_enabled);
-		fprintf(fp, "\tprocess_performance_data=%d\n", temp_service->process_performance_data);
-		fprintf(fp, "\tobsess=%d\n", temp_service->obsess);
-		fprintf(fp, "\tis_flapping=%d\n", temp_service->is_flapping);
-		fprintf(fp, "\tpercent_state_change=%.2f\n", temp_service->percent_state_change);
-		fprintf(fp, "\tscheduled_downtime_depth=%d\n", temp_service->scheduled_downtime_depth);
-		fprintf(fp, "\tlast_update=%s\n", tv_str(&temp_service->last_update));
+		sb_kv_int(&sb, "has_been_checked", temp_service->has_been_checked);
+		sb_kv_dbl(&sb, "check_execution_time", "%.3f", temp_service->execution_time);
+		sb_kv_dbl(&sb, "check_latency", "%.3f", temp_service->latency);
+		sb_kv_int(&sb, "check_type", temp_service->check_type);
+		sb_kv_int(&sb, "current_state", temp_service->current_state);
+		sb_kv_int(&sb, "last_hard_state", temp_service->last_hard_state);
+		sb_kv_uint(&sb, "last_event_id", temp_service->last_event_id);
+		sb_kv_uint(&sb, "current_event_id", temp_service->current_event_id);
+		sb_kv_str(&sb, "current_problem_id", temp_service->current_problem_id);
+		sb_kv_str(&sb, "last_problem_id", temp_service->last_problem_id);
+		sb_kv_uint(&sb, "problem_start", temp_service->problem_start);
+		sb_kv_uint(&sb, "problem_end", temp_service->problem_end);
+		sb_kv_int(&sb, "current_attempt", temp_service->current_attempt);
+		sb_kv_int(&sb, "max_attempts", temp_service->max_attempts);
+		sb_kv_int(&sb, "state_type", temp_service->state_type);
+		sb_kv_uint(&sb, "last_state_change", temp_service->last_state_change);
+		sb_kv_uint(&sb, "last_hard_state_change", temp_service->last_hard_state_change);
+		sb_kv_uint(&sb, "last_time_ok", temp_service->last_time_ok);
+		sb_kv_uint(&sb, "last_time_warning", temp_service->last_time_warning);
+		sb_kv_uint(&sb, "last_time_unknown", temp_service->last_time_unknown);
+		sb_kv_uint(&sb, "last_time_critical", temp_service->last_time_critical);
+		sb_kv_str(&sb, "plugin_output", temp_service->plugin_output);
+		sb_kv_str(&sb, "long_plugin_output", temp_service->long_plugin_output);
+		sb_kv_str(&sb, "performance_data", temp_service->perf_data);
+		sb_kv_uint(&sb, "last_check", temp_service->last_check);
+		sb_kv_uint(&sb, "next_check", temp_service->next_check);
+		sb_kv_int(&sb, "check_options", temp_service->check_options);
+		sb_kv_int(&sb, "current_notification_number", temp_service->current_notification_number);
+		sb_kv_str(&sb, "current_notification_id", temp_service->current_notification_id);
+		sb_kv_uint(&sb, "last_notification", temp_service->last_notification);
+		sb_kv_uint(&sb, "next_notification", temp_service->next_notification);
+		sb_kv_int(&sb, "no_more_notifications", temp_service->no_more_notifications);
+		sb_kv_int(&sb, "notifications_enabled", temp_service->notifications_enabled);
+		sb_kv_int(&sb, "active_checks_enabled", temp_service->checks_enabled);
+		sb_kv_int(&sb, "passive_checks_enabled", temp_service->accept_passive_checks);
+		sb_kv_int(&sb, "event_handler_enabled", temp_service->event_handler_enabled);
+		sb_kv_int(&sb, "problem_has_been_acknowledged", temp_service->problem_has_been_acknowledged);
+		sb_kv_int(&sb, "acknowledgement_type", temp_service->acknowledgement_type);
+		sb_kv_uint(&sb, "acknowledgement_end_time", temp_service->acknowledgement_end_time);
+		sb_kv_int(&sb, "flap_detection_enabled", temp_service->flap_detection_enabled);
+		sb_kv_int(&sb, "process_performance_data", temp_service->process_performance_data);
+		sb_kv_int(&sb, "obsess", temp_service->obsess);
+		sb_kv_int(&sb, "is_flapping", temp_service->is_flapping);
+		sb_kv_dbl(&sb, "percent_state_change", "%.2f", temp_service->percent_state_change);
+		sb_kv_int(&sb, "scheduled_downtime_depth", temp_service->scheduled_downtime_depth);
+		sb_kv_str(&sb, "last_update", tv_str(&temp_service->last_update));
 		/* custom variables */
 		for (temp_customvariablesmember = temp_service->custom_variables; temp_customvariablesmember != NULL; temp_customvariablesmember = temp_customvariablesmember->next) {
 			if (temp_customvariablesmember->variable_name)
-				fprintf(fp, "\t_%s=%d;%s\n", temp_customvariablesmember->variable_name, temp_customvariablesmember->has_been_modified, (temp_customvariablesmember->variable_value == NULL) ? "" : temp_customvariablesmember->variable_value);
+				sb_customvar(&sb, temp_customvariablesmember);
 		}
-		fprintf(fp, "\t}\n\n");
+		sb_lit(&sb, "\t}\n\n");
 	}
 
 	/* save contact status data */
 	for (temp_contact = contact_list; temp_contact != NULL; temp_contact = temp_contact->next) {
 
-		fprintf(fp, "contactstatus {\n");
-		fprintf(fp, "\tcontact_name=%s\n", temp_contact->name);
+		sb_lit(&sb, "contactstatus {\n");
+		sb_kv_str(&sb, "contact_name", temp_contact->name);
 
-		fprintf(fp, "\tmodified_attributes=%lu\n", temp_contact->modified_attributes);
-		fprintf(fp, "\tmodified_host_attributes=%lu\n", temp_contact->modified_host_attributes);
-		fprintf(fp, "\tmodified_service_attributes=%lu\n", temp_contact->modified_service_attributes);
-		fprintf(fp, "\thost_notification_period=%s\n", (temp_contact->host_notification_period == NULL) ? "" : temp_contact->host_notification_period);
-		fprintf(fp, "\tservice_notification_period=%s\n", (temp_contact->service_notification_period == NULL) ? "" : temp_contact->service_notification_period);
+		sb_kv_uint(&sb, "modified_attributes", temp_contact->modified_attributes);
+		sb_kv_uint(&sb, "modified_host_attributes", temp_contact->modified_host_attributes);
+		sb_kv_uint(&sb, "modified_service_attributes", temp_contact->modified_service_attributes);
+		sb_kv_str(&sb, "host_notification_period", temp_contact->host_notification_period);
+		sb_kv_str(&sb, "service_notification_period", temp_contact->service_notification_period);
 
-		fprintf(fp, "\tlast_host_notification=%lu\n", temp_contact->last_host_notification);
-		fprintf(fp, "\tlast_service_notification=%lu\n", temp_contact->last_service_notification);
-		fprintf(fp, "\thost_notifications_enabled=%d\n", temp_contact->host_notifications_enabled);
-		fprintf(fp, "\tservice_notifications_enabled=%d\n", temp_contact->service_notifications_enabled);
+		sb_kv_uint(&sb, "last_host_notification", temp_contact->last_host_notification);
+		sb_kv_uint(&sb, "last_service_notification", temp_contact->last_service_notification);
+		sb_kv_int(&sb, "host_notifications_enabled", temp_contact->host_notifications_enabled);
+		sb_kv_int(&sb, "service_notifications_enabled", temp_contact->service_notifications_enabled);
 		/* custom variables */
 		for (temp_customvariablesmember = temp_contact->custom_variables; temp_customvariablesmember != NULL; temp_customvariablesmember = temp_customvariablesmember->next) {
 			if (temp_customvariablesmember->variable_name)
-				fprintf(fp, "\t_%s=%d;%s\n", temp_customvariablesmember->variable_name, temp_customvariablesmember->has_been_modified, (temp_customvariablesmember->variable_value == NULL) ? "" : temp_customvariablesmember->variable_value);
+				sb_customvar(&sb, temp_customvariablesmember);
 		}
-		fprintf(fp, "\t}\n\n");
+		sb_lit(&sb, "\t}\n\n");
 	}
 
 	/* save all comments */
@@ -344,22 +519,22 @@ int xsddefault_save_status_data(void)
 		while (g_hash_table_iter_next(&iter, NULL, &comment_)) {
 			temp_comment = comment_;
 			if (temp_comment->comment_type == HOST_COMMENT)
-				fprintf(fp, "hostcomment {\n");
+				sb_lit(&sb, "hostcomment {\n");
 			else
-				fprintf(fp, "servicecomment {\n");
-			fprintf(fp, "\thost_name=%s\n", temp_comment->host_name);
+				sb_lit(&sb, "servicecomment {\n");
+			sb_kv_str(&sb, "host_name", temp_comment->host_name);
 			if (temp_comment->comment_type == SERVICE_COMMENT)
-				fprintf(fp, "\tservice_description=%s\n", temp_comment->service_description);
-			fprintf(fp, "\tentry_type=%d\n", temp_comment->entry_type);
-			fprintf(fp, "\tcomment_id=%lu\n", temp_comment->comment_id);
-			fprintf(fp, "\tsource=%d\n", temp_comment->source);
-			fprintf(fp, "\tpersistent=%d\n", temp_comment->persistent);
-			fprintf(fp, "\tentry_time=%lu\n", temp_comment->entry_time);
-			fprintf(fp, "\texpires=%d\n", temp_comment->expires);
-			fprintf(fp, "\texpire_time=%lu\n", temp_comment->expire_time);
-			fprintf(fp, "\tauthor=%s\n", temp_comment->author);
-			fprintf(fp, "\tcomment_data=%s\n", temp_comment->comment_data);
-			fprintf(fp, "\t}\n\n");
+				sb_kv_str(&sb, "service_description", temp_comment->service_description);
+			sb_kv_int(&sb, "entry_type", temp_comment->entry_type);
+			sb_kv_uint(&sb, "comment_id", temp_comment->comment_id);
+			sb_kv_int(&sb, "source", temp_comment->source);
+			sb_kv_int(&sb, "persistent", temp_comment->persistent);
+			sb_kv_uint(&sb, "entry_time", temp_comment->entry_time);
+			sb_kv_int(&sb, "expires", temp_comment->expires);
+			sb_kv_uint(&sb, "expire_time", temp_comment->expire_time);
+			sb_kv_str(&sb, "author", temp_comment->author);
+			sb_kv_str(&sb, "comment_data", temp_comment->comment_data);
+			sb_lit(&sb, "\t}\n\n");
 		}
 	}
 
@@ -367,40 +542,41 @@ int xsddefault_save_status_data(void)
 	for (temp_downtime = scheduled_downtime_list; temp_downtime != NULL; temp_downtime = temp_downtime->next) {
 
 		if (temp_downtime->type == HOST_DOWNTIME)
-			fprintf(fp, "hostdowntime {\n");
+			sb_lit(&sb, "hostdowntime {\n");
 		else
-			fprintf(fp, "servicedowntime {\n");
-		fprintf(fp, "\thost_name=%s\n", temp_downtime->host_name);
+			sb_lit(&sb, "servicedowntime {\n");
+		sb_kv_str(&sb, "host_name", temp_downtime->host_name);
 		if (temp_downtime->type == SERVICE_DOWNTIME)
-			fprintf(fp, "\tservice_description=%s\n", temp_downtime->service_description);
-		fprintf(fp, "\tdowntime_id=%lu\n", temp_downtime->downtime_id);
-		fprintf(fp, "\tcomment_id=%lu\n", temp_downtime->comment_id);
-		fprintf(fp, "\tentry_time=%lu\n", temp_downtime->entry_time);
-		fprintf(fp, "\tstart_time=%lu\n", temp_downtime->start_time);
-		fprintf(fp, "\tflex_downtime_start=%lu\n", temp_downtime->flex_downtime_start);
-		fprintf(fp, "\tend_time=%lu\n", temp_downtime->end_time);
-		fprintf(fp, "\ttriggered_by=%lu\n", temp_downtime->triggered_by);
-		fprintf(fp, "\tfixed=%d\n", temp_downtime->fixed);
-		fprintf(fp, "\tduration=%lu\n", temp_downtime->duration);
-		fprintf(fp, "\tis_in_effect=%d\n", temp_downtime->is_in_effect);
-		fprintf(fp, "\tstart_notification_sent=%d\n", temp_downtime->start_notification_sent);
-		fprintf(fp, "\tauthor=%s\n", temp_downtime->author);
-		fprintf(fp, "\tcomment=%s\n", temp_downtime->comment);
-		fprintf(fp, "\t}\n\n");
+			sb_kv_str(&sb, "service_description", temp_downtime->service_description);
+		sb_kv_uint(&sb, "downtime_id", temp_downtime->downtime_id);
+		sb_kv_uint(&sb, "comment_id", temp_downtime->comment_id);
+		sb_kv_uint(&sb, "entry_time", temp_downtime->entry_time);
+		sb_kv_uint(&sb, "start_time", temp_downtime->start_time);
+		sb_kv_uint(&sb, "flex_downtime_start", temp_downtime->flex_downtime_start);
+		sb_kv_uint(&sb, "end_time", temp_downtime->end_time);
+		sb_kv_uint(&sb, "triggered_by", temp_downtime->triggered_by);
+		sb_kv_int(&sb, "fixed", temp_downtime->fixed);
+		sb_kv_uint(&sb, "duration", temp_downtime->duration);
+		sb_kv_int(&sb, "is_in_effect", temp_downtime->is_in_effect);
+		sb_kv_int(&sb, "start_notification_sent", temp_downtime->start_notification_sent);
+		sb_kv_str(&sb, "author", temp_downtime->author);
+		sb_kv_str(&sb, "comment", temp_downtime->comment);
+		sb_lit(&sb, "\t}\n\n");
 	}
 
 
+	/* flush the remaining buffer to disk */
+	sb_flush(&sb);
+	nm_free(sb.buf);
+
 	/* reset file permissions */
 	fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
-
-	/* flush the file to disk */
-	fflush(fp);
 
 	/* fsync the file so that it is completely written out before moving it */
 	fsync(fd);
 
 	/* close the temp file */
-	result = ferror(fp) | fclose(fp);
+	result = sb.error | close(fd);
 
 	/* save/close was successful */
 	if (result == 0) {
