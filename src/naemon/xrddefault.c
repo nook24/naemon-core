@@ -181,6 +181,23 @@ int xrddefault_save_state_information(void)
 		nm_wb_kv_int(&wb, "current_attempt", temp_host->current_attempt);
 		nm_wb_kv_int(&wb, "max_attempts", temp_host->max_attempts);
 		nm_wb_kv_dbl(&wb, "normal_check_interval", "%f", temp_host->check_interval);
+		/*
+		 * FIXME: this writes check_interval, not retry_interval, and has done
+		 * since the code was written -- the service block a few dozen lines
+		 * below gets it right (retry_check_interval=temp_service->retry_interval),
+		 * so this is a copy/paste slip rather than a deliberate choice.
+		 *
+		 * Effect: a host whose retry_interval was changed at runtime (external
+		 * command CHANGE_RETRY_HOST_CHECK_INTERVAL, which is what sets
+		 * MODATTR_RETRY_CHECK_INTERVAL) has that change silently replaced by its
+		 * normal check_interval when the retention file is read back. Hosts whose
+		 * retry_interval was never modified are unaffected, because the reader
+		 * only applies this value when MODATTR_RETRY_CHECK_INTERVAL is set.
+		 *
+		 * Left as-is on purpose: correcting it changes what an existing
+		 * retention.dat means, so it wants its own patch and its own decision
+		 * rather than riding along with a performance change.
+		 */
 		nm_wb_kv_dbl(&wb, "retry_check_interval", "%f", temp_host->check_interval);
 		nm_wb_kv_int(&wb, "state_type", temp_host->state_type);
 		nm_wb_kv_uint(&wb, "last_state_change", temp_host->last_state_change);
