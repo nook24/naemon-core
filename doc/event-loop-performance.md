@@ -39,10 +39,10 @@ See `contrib/perfbench/README.md` to reproduce.
 
 - Synthetic load. A real installation also spends time in notifications,
   flapping, event handlers and broker modules, none of which this exercises.
-- **No event broker module was loaded.** Most real installations run one
-  (Statusengine, mod_gearman, livestatus). That changes the profile, and in
-  particular it changes what the NEB early-out below is worth. Numbers here
-  are a floor, not a prediction.
+- The headline numbers below were taken **without an event broker module**.
+  Most real installations run one, and that does not just shift the numbers,
+  it changes which code is worth optimising at all. There is a section on
+  this further down; read it before drawing conclusions from the table.
 - The status file cost scales with *object count*; the check pipeline scales
   with *check rate*. A small installation sees a very different split.
 - Measured under WSL2. Syscall and I/O costs differ from bare metal.
@@ -61,6 +61,76 @@ See `contrib/perfbench/README.md` to reproduce.
 Extrapolated to a saturated core the ceiling moves from roughly 20 000 to
 roughly 38 000 checks per second. That extrapolation is linear and therefore
 optimistic; treat it as an order of magnitude.
+
+## With an event broker module loaded, the picture changes completely
+
+The numbers above describe naemon on its own. Measured again with the
+Statusengine broker loaded (Gearman on localhost, worker processes draining
+the queues so that a backed-up job server could not be mistaken for naemon
+being slow), the same 100k service workload gives:
+
+| | no broker | Statusengine loaded |
+|---|---|---|
+| loop CPU per check, before this work | 50.1 µs | 291.5 µs |
+| loop CPU per check, after | 26.2 µs | 237.5 µs |
+| share of one core at ~1760 checks/s, after | 4.2 % | 38.5 % |
+
+The broker adds on the order of **210 µs per check**, which is roughly ten
+times everything else in the event loop put together. `perf` on the main
+thread, 36 000 samples:
+
+```
+84.7 %  neb_make_callbacks
+ 79.0 %    statusengine::Statusengine::Callback
+   57.0 %      broker_service_status      (via update_service_status)
+   27.5 %      broker_service_check
+ 20.7 %    json_object_to_json_string_length
+ 18.7 %  _int_malloc (self)               allocation churn out of json-c
+```
+
+Two things follow from this.
+
+First, the work in this document is worth **−18 % per check** in a
+Statusengine deployment, not the −48 % the standalone numbers suggest. Still
+worth having, but the standalone figure is not the one to quote at anyone
+running a broker.
+
+Second, and more usefully: `broker_service_status` alone is 57 % of the loop,
+and it fires **twice per check**.
+
+- `checks_service.c`, in `schedule_next_service_check()` — because
+  `next_check` and `check_options` were just updated. This runs at the *start*
+  of every check, when `handle_service_check_event()` reschedules.
+- `checks_service.c`, in `handle_async_service_check_result()` — when the
+  result actually arrives.
+
+Both carry the same `next_check`; the first differs from the second mostly by
+the check's own runtime. So one full serialisation of the service object per
+check is being produced for very little new information.
+
+This has **not** been changed. It is not naemon's call alone to make: dropping
+the event changes what a broker sees, and a consumer that renders `next_check`
+would show it moving one check later than it does today. It is written down
+here because it is where the money is for anyone running a broker, and because
+the decision belongs to the naemon and broker maintainers together rather than
+to a performance patch.
+
+It was measured, though, by building a variant with just that one call
+removed and running it against the same load:
+
+| | µs of loop CPU per check | share of one core |
+|---|---|---|
+| current | 269.5 | 43.5 % |
+| without the reschedule status event | 165.4 | 24.5 % |
+
+**−39 % per check**, from removing a single line. For scale, that is more than
+the whole of the rest of this document put together, and about thirty times
+what is left to win in macro expansion (see below).
+
+(The two variants processed check counts differing by 8 %, so the per-check
+normalisation is doing real work here. Even taking the pessimistic reading —
+scaling the cheaper variant up to the same check count — it lands at 8.75 s
+against 14.24 s, which is the same conclusion.)
 
 ---
 
@@ -195,9 +265,10 @@ broker modules that is two allocations and two frees per call, and
 It now returns early when no callback is registered for that type. The return
 code is unchanged; an empty result set yielded 0 before as well.
 
-**This one only helps installations without a broker module**, which is not the
-common case. With Statusengine or mod_gearman loaded the callbacks are real and
-this early-out never fires.
+**This mostly helps installations without a broker module.** With Statusengine
+or mod_gearman loaded, the callback types the module actually subscribes to do
+real work and the early-out never fires for them; it still fires for the types
+nothing is subscribed to, which is why it is not worthless there either.
 
 ### 7. `nsock_unix()` stack overflow (a real bug, unrelated to performance)
 
@@ -247,7 +318,7 @@ percentages would have been before:
 
 | Area | Share | Note |
 |---|---|---|
-| Macro expansion | ~8 % | `process_macros_r` builds its output quadratically: `strlen` + `realloc` + `strcat` per `$`-delimited segment. Next candidate. |
+| Macro expansion | ~8 % without a broker, **~2.4 % with one** | `process_macros_r` builds its output quadratically: `strlen` + `realloc` + `strcat` per `$`-delimited segment, and `clean_macro_chars()` allocates a copy of every macro value even when nothing needs stripping. Worth roughly 1 % of a broker-loaded loop, so not the next thing to do. |
 | Status writer | ~32 % | now split between the integer formatter and the five doubles per object |
 | malloc churn | ~8 % | a check result, a job, several `strdup`s and a kvvec per check, all freed moments later |
 | Event heap | ~4 % | |
@@ -256,6 +327,19 @@ One structural item not addressed: `event_poll_full()` runs **at most one timed
 event per `epoll_wait()`**, and returns without running any when a descriptor
 had input. At 1 760 checks/s the extra syscalls are noise. At 20 000 they would
 not be.
+
+### What to do next, in order of value
+
+For an installation running a broker module — which is most of them — the
+ranking is not close:
+
+1. **The duplicate `broker_service_status` per check.** −39 %. Needs a decision
+   from the naemon and broker maintainers, not a patch from one side.
+2. Everything else in this document. Already done, −18 % on top.
+3. Macro expansion. ~1 %.
+
+Optimising naemon further without addressing (1) is polishing a part of the
+system that is no longer where the time goes.
 
 ## Things to be careful about when continuing
 
