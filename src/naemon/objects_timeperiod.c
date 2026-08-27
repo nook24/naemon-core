@@ -411,6 +411,121 @@ static int get_dst_shift(time_t *start, time_t *end)
 
 
 /*#define TEST_TIMEPERIODS_A 1*/
+/*
+ * Cache of the local day the last timeperiod lookup fell into.
+ *
+ * check_time_against_period() is called for every scheduled check and used to
+ * do two localtime_r()/mktime() round trips per call, which showed up as
+ * several percent of the event loop's CPU time. All callers ask about "now",
+ * so caching the current day removes almost all of them.
+ *
+ * Days containing a DST transition are deliberately never cached: there the
+ * answer depends on the tm_isdst localtime_r() reported for the timestamp
+ * being tested, so a single cached answer for the whole day would change
+ * behaviour. Those days fall through to the original computation on every
+ * call, exactly as before.
+ */
+struct day_cache {
+	time_t midnight;
+	time_t valid_until; /* 0 when this day must not be cached */
+	int year;           /* tm_year/tm_mon/tm_wday as localtime_r() reported */
+	int mon;            /* them for the tested timestamp, before mktime() */
+	int wday;
+	struct tm tm;       /* mktime()-normalized tm of midnight, used as scratch base */
+	/* fingerprint of the timezone the cached values were computed in */
+	long tz_offset;
+	int tz_daylight;
+	char tz_name[2][32];
+};
+static struct day_cache day_cache;
+
+/*
+ * A cached day is only meaningful for the timezone it was computed in, and
+ * the timezone can be switched underneath us by a tzset(). These globals are
+ * what tzset() updates, so comparing them is enough to notice a switch, and
+ * it is far cheaper than the localtime_r()/mktime() pair it guards.
+ */
+static int day_cache_tz_matches(void)
+{
+	return day_cache.tz_offset == timezone &&
+	       day_cache.tz_daylight == daylight &&
+	       !strcmp(day_cache.tz_name[0], tzname[0] ? tzname[0] : "") &&
+	       !strcmp(day_cache.tz_name[1], tzname[1] ? tzname[1] : "");
+}
+
+static void day_cache_store_tz(void)
+{
+	day_cache.tz_offset = timezone;
+	day_cache.tz_daylight = daylight;
+	strncpy(day_cache.tz_name[0], tzname[0] ? tzname[0] : "", sizeof(day_cache.tz_name[0]) - 1);
+	day_cache.tz_name[0][sizeof(day_cache.tz_name[0]) - 1] = '\0';
+	strncpy(day_cache.tz_name[1], tzname[1] ? tzname[1] : "", sizeof(day_cache.tz_name[1]) - 1);
+	day_cache.tz_name[1][sizeof(day_cache.tz_name[1]) - 1] = '\0';
+}
+
+static const struct day_cache *get_day_cache(time_t when)
+{
+	struct tm *t, tm_s, next, probe;
+	time_t next_midnight, probe_midnight;
+
+	if (day_cache.valid_until != 0 &&
+	    when >= day_cache.midnight && when < day_cache.valid_until &&
+	    day_cache_tz_matches())
+		return &day_cache;
+
+	t = localtime_r((time_t *)&when, &tm_s);
+	if (t == NULL)
+		return NULL;
+
+	day_cache.year = t->tm_year;
+	day_cache.mon = t->tm_mon;
+	day_cache.wday = t->tm_wday;
+
+	t->tm_sec = 0;
+	t->tm_min = 0;
+	t->tm_hour = 0;
+
+	/*
+	 * Probe for a DST transition: a local day that is not exactly 86400
+	 * seconds long is not safe to cache. Both ends of the probe are
+	 * resolved with tm_isdst = -1, because the midnight computed below
+	 * inherits its tm_isdst from the timestamp being tested and is
+	 * therefore itself shifted on a transition day -- measuring from it
+	 * would make such a day look 86400 seconds long.
+	 */
+	probe = *t;
+	probe.tm_isdst = -1;
+	probe_midnight = mktime(&probe);
+
+	next = *t;
+	next.tm_mday += 1;
+	next.tm_isdst = -1;
+	next_midnight = mktime(&next);
+
+	day_cache.tm = *t;
+	day_cache.midnight = mktime(&day_cache.tm);
+
+	if (probe_midnight != (time_t) -1 && next_midnight != (time_t) -1 &&
+	    next_midnight - probe_midnight == 86400 &&
+	    day_cache.midnight == probe_midnight)
+		day_cache.valid_until = next_midnight;
+	else
+		day_cache.valid_until = 0;
+
+	day_cache_store_tz();
+
+	return &day_cache;
+}
+
+static inline time_t get_midnight(time_t when)
+{
+	const struct day_cache *dc = get_day_cache(when);
+
+	if (dc == NULL)
+		return (time_t)0L;
+	return dc->midnight;
+}
+
 static timerange *_get_matching_timerange(time_t test_time, const timeperiod *tperiod)
 {
 	daterange *temp_daterange = NULL;
@@ -425,20 +540,22 @@ static timerange *_get_matching_timerange(time_t test_time, const timeperiod *tp
 	int test_time_year = 0;
 	int test_time_mon = 0;
 	int test_time_wday = 0;
+	const struct day_cache *dc;
 
 	if (tperiod == NULL)
 		return NULL;
 
-	t = localtime_r((time_t *)&test_time, &tm_s);
-	test_time_year = t->tm_year;
-	test_time_mon = t->tm_mon;
-	test_time_wday = t->tm_wday;
+	dc = get_day_cache(test_time);
+	if (dc == NULL)
+		return NULL;
 
-	/* calculate the start of the day (midnight, 00:00 hours) when the specified test time occurs */
-	t->tm_sec = 0;
-	t->tm_min = 0;
-	t->tm_hour = 0;
-	midnight = mktime(t);
+	/* tm_s is used as scratch space below, so work on a copy */
+	tm_s = dc->tm;
+	t = &tm_s;
+	test_time_year = dc->year;
+	test_time_mon = dc->mon;
+	test_time_wday = dc->wday;
+	midnight = dc->midnight;
 
 	/**** check exceptions first ****/
 	for (daterange_type = 0; daterange_type < DATERANGE_TYPES; daterange_type++) {
@@ -637,17 +754,6 @@ static int is_time_excluded(time_t when, const struct timeperiod *tp)
 		}
 	}
 	return 0;
-}
-
-static inline time_t get_midnight(time_t when)
-{
-	struct tm *t, tm_s;
-
-	t = localtime_r((time_t *)&when, &tm_s);
-	t->tm_sec = 0;
-	t->tm_min = 0;
-	t->tm_hour = 0;
-	return mktime(t);
 }
 
 static inline int timerange_includes_time(struct timerange *range, time_t when)
