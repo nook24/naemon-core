@@ -412,18 +412,77 @@ static int get_dst_shift(time_t *start, time_t *end)
 
 /*#define TEST_TIMEPERIODS_A 1*/
 /*
- * Cache of the local day the last timeperiod lookup fell into.
+ * ============================================================================
+ * Cache of the local day a timeperiod lookup falls into
+ * ============================================================================
  *
- * check_time_against_period() is called for every scheduled check and used to
- * do two localtime_r()/mktime() round trips per call, which showed up as
- * several percent of the event loop's CPU time. All callers ask about "now",
- * so caching the current day removes almost all of them.
+ * WHY THIS EXISTS
  *
- * Days containing a DST transition are deliberately never cached: there the
- * answer depends on the tm_isdst localtime_r() reported for the timestamp
- * being tested, so a single cached answer for the whole day would change
- * behaviour. Those days fall through to the original computation on every
- * call, exactly as before.
+ * Timeperiods are expressed as ranges within a day ("09:00-17:00"), so to
+ * decide whether a timestamp is inside one you first need to know when that
+ * day started locally. That is what get_midnight() answers.
+ *
+ * Computing it means localtime_r() to break the timestamp into local
+ * calendar fields, zeroing the time of day, and mktime() to turn it back into
+ * a time_t. mktime() in particular is not cheap -- it has to consult the
+ * timezone rules. check_time_against_period() did this once itself and
+ * _get_matching_timerange() did it again, so every check that got dispatched
+ * paid for two of these round trips. In the profile that was ~3.4% of the
+ * event loop.
+ *
+ * Every caller is asking about "now", so between one check and the next the
+ * answer is nearly always the same. Caching the current day removes almost
+ * all of the work.
+ *
+ *
+ * WHY IT IS NOT JUST "midnight + 86400"
+ *
+ * A local day is not always 86400 seconds long, and its midnight is not
+ * always unambiguous:
+ *
+ *   - On a DST spring-forward day the local day is 23 hours (82800s).
+ *   - On a DST fall-back day it is 25 hours (90000s).
+ *   - Lord Howe Island shifts by 30 minutes, so 84600s / 88200s.
+ *   - In some zones (America/Havana, America/Santiago, Asia/Beirut) the
+ *     transition happens *at midnight*, so local 00:00 does not exist at all
+ *     on that day.
+ *   - Under a "right/" timezone, which counts leap seconds, a day can be
+ *     86401 seconds.
+ *
+ * On those days the answer genuinely depends on the tm_isdst that
+ * localtime_r() reported for the specific timestamp being tested, so a single
+ * cached answer for the whole day would change behaviour. Rather than trying
+ * to be clever, those days are simply never cached: get_day_cache() detects
+ * them and falls through to the original computation on every call.
+ *
+ * The detection has one subtlety worth spelling out, because getting it wrong
+ * is exactly the bug this code went through once already. You cannot measure
+ * the day length starting from the midnight computed for the timestamp under
+ * test, because on a transition day *that midnight is itself shifted* -- and
+ * a shifted start plus a normal next-midnight measures to exactly 86400,
+ * making a transition day look perfectly ordinary. Both ends of the probe
+ * must therefore be resolved with tm_isdst = -1, which asks the C library to
+ * work out the offset itself.
+ *
+ * Days that are ordinary in this sense are cached, and that includes cases
+ * that look exotic but are not: a leap day (29 February) is a normal 86400
+ * second day, and so is the day after a zone skipped a calendar day entirely
+ * (Pacific/Apia in 2011, Pacific/Kiritimati in 1994).
+ *
+ *
+ * WHAT ABOUT THE SYSTEM CLOCK BEING CHANGED?
+ *
+ * Nothing special is needed. The cache is keyed on the timestamp passed in,
+ * not on wall clock time, so a clock that jumps forwards or backwards simply
+ * produces an argument outside the cached window and the day is recomputed.
+ *
+ * A timezone switch is the one thing that does need handling, since that
+ * changes the answer for timestamps already inside the window. tzset() is
+ * what applies such a switch, and it maintains the timezone/daylight/tzname
+ * globals, so the cache records those and discards itself when they change.
+ *
+ * There is a stress test for all of the above in tests/test-timeperiod-daycache.c.
+ * ============================================================================
  */
 struct day_cache {
 	time_t midnight;
