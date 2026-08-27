@@ -67,6 +67,7 @@ neb_cb_resultset * neb_make_callbacks_full(enum NEBCallbackType callback_type, v
  * @param user_data Opaque pointer passed to callback
  * @return The return code of the callback result
  */
+int neb_callbacks_registered(enum NEBCallbackType callback_type);
 int neb_make_callbacks(enum NEBCallbackType callback_type, void * user_data);
 
 /***** CALLBACK RESULT *****/
