@@ -34,16 +34,6 @@ static int run_scheduled_service_check(service *, int, double);
 /* Result handling (After worker job is executed) */
 static void handle_worker_service_check(wproc_result *wpres, void *arg, int flags);
 
-/*
- * What a dispatched check hands to its worker callback. Carrying the service
- * along means the result does not have to be matched back to its object by
- * name, which is a hash lookup plus two string compares per check.
- */
-struct service_check_job {
-	service *svc;
-	check_result *cr;
-};
-
 /* Extra features */
 static void check_service_result_freshness(struct nm_event_execution_properties *evprop);
 static void check_for_orphaned_services_eventhandler(struct nm_event_execution_properties *evprop);
@@ -351,7 +341,6 @@ static int run_scheduled_service_check(service *svc, int check_options, double l
 	struct timeval start_time, end_time;
 	host *temp_host = NULL;
 	check_result *cr;
-	struct service_check_job *job;
 	int runchk_result = OK;
 	int macro_options = STRIP_ILLEGAL_MACRO_CHARS | ESCAPE_MACRO_CHARS;
 	int neb_result = OK;
@@ -421,6 +410,12 @@ static int run_scheduled_service_check(service *svc, int check_options, double l
 
 	/* save check info */
 	cr->object_check_type = SERVICE_CHECK;
+	/*
+	 * Hand the service along with the result. Without it the worker callback
+	 * would have to find its way back to this object by name, which is a hash
+	 * lookup plus two string compares for every check that comes back.
+	 */
+	cr->object_ptr = svc;
 	cr->check_type = CHECK_TYPE_ACTIVE;
 	cr->check_options = check_options;
 	cr->scheduled_check = TRUE;
@@ -447,10 +442,7 @@ static int run_scheduled_service_check(service *svc, int check_options, double l
 	}
 
 	/* paw off the check to a worker to run */
-	job = nm_calloc(1, sizeof(*job));
-	job->svc = svc;
-	job->cr = cr;
-	runchk_result = wproc_run_callback(processed_command, svc->check_timeout, handle_worker_service_check, (void *)job, &mac);
+	runchk_result = wproc_run_callback(processed_command, svc->check_timeout, handle_worker_service_check, (void *)cr, &mac);
 	if (runchk_result == ERROR) {
 		nm_log(NSLOG_RUNTIME_ERROR,
 		       "Unable to send check for service '%s' on host '%s' to worker (ret=%d)\n", svc->description, svc->host_name, runchk_result);
@@ -475,8 +467,8 @@ static int run_scheduled_service_check(service *svc, int check_options, double l
 
 static void handle_worker_service_check(wproc_result *wpres, void *arg, int flags)
 {
-	struct service_check_job *job = (struct service_check_job *)arg;
-	check_result *cr = job->cr;
+	check_result *cr = (check_result *)arg;
+	service *svc;
 	if (wpres) {
 		memcpy(&cr->rusage, &wpres->rusage, sizeof(wpres->rusage));
 		cr->start_time.tv_sec = wpres->start.tv_sec;
@@ -506,12 +498,12 @@ static void handle_worker_service_check(wproc_result *wpres, void *arg, int flag
 		if (cr->output != NULL)
 			rstrip(cr->output);
 
-		job->svc->check_source = check_result_source(cr);
-		handle_async_service_check_result(job->svc, cr);
+		svc = (service *)cr->object_ptr;
+		svc->check_source = check_result_source(cr);
+		handle_async_service_check_result(svc, cr);
 	}
 	free_check_result(cr);
 	nm_free(cr);
-	nm_free(job);
 }
 
 

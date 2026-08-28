@@ -185,13 +185,51 @@ string compare — although the code that dispatched the check had the pointer i
 hand the whole time. 5.4 % of the loop. `handle_worker_host_check()` paid for it
 twice, because it also looked the host up itself.
 
-The object now travels to the result callback in a small job struct.
+The object now travels with the result, in a new `object_ptr` member of
+`check_result`. `process_check_result()` uses it when it is set and falls back
+to the lookup when it is NULL, so every existing caller keeps working.
 
-**Note for anyone extending this:** the pointer deliberately does *not* go into
-`check_result`. That struct is part of the public API and event broker modules
-populate it field by field, so a new member arrives uninitialised in results
-submitted by a module. The first attempt did exactly that and crashed
-`tests/test-scheduled-downtimes`, which builds one on the stack.
+**Why this took two attempts.** `check_result` is part of the public API and
+modules populate it field by field, so a new member arrives holding whatever
+was on the caller's stack — not NULL, which means a NULL check is no defence.
+The first attempt did exactly that and crashed `tests/test-scheduled-downtimes`,
+which builds one on the stack without zeroing it. The intermediate fix carried
+the pointer past `check_result` in a private job struct instead.
+
+What makes the field safe is `nebmods.c:197`: naemon refuses to load any module
+whose `__neb_api_version` is not *exactly* `CURRENT_NEB_API_VERSION`. Bumping
+that from 8 to 9 means a module compiled against the old struct cannot load at
+all, so it can never submit a result with an uninitialised `object_ptr`. This
+was verified by building a module against v8 and confirming the refusal:
+
+```
+Error: Module '...statusdiff_v8.so' is using an incompatible version (v8) of
+the event broker API (current version: v9). Module will be unloaded.
+```
+
+`init_check_result()` was also changed to `memset()` the whole struct rather
+than assign 18 fields individually — it had been quietly missing `output_file`,
+`timeout` and `rusage`, which stayed as stack garbage even after the struct had
+been "initialised". Removing that `memset` makes three of the result-processing
+tests crash outright, which is the failure mode this guards against.
+
+**What it is worth.** Active checks were already covered by the job struct this
+replaces, so no large gain was expected here. Three interleaved pairs without a
+broker, on identical check counts:
+
+| | µs of loop CPU per check |
+|---|---|
+| job struct | 26.63 (26.0 / 26.0 / 27.9) |
+| `object_ptr` | 26.07 (25.1 / 25.5 / 27.6) |
+
+**−2.1 %**, negative in all three pairs (−0.9, −0.5, −0.3 µs). Smaller than the
+run-to-run spread, so the paired deltas are what carry it, not the means — but
+the sign is consistent and the mechanism is identifiable: the job struct cost
+one `nm_calloc()` and one `nm_free()` per check, and those are gone.
+
+The real point of the field is elsewhere: a broker module handing back a result
+for an object it already tracks — mod_gearman is the obvious case — can now skip
+the lookup too, which the job struct could never offer.
 
 ### 3. Event heap sort keys stored inline
 
@@ -495,7 +533,11 @@ that is no longer where the time goes.
 
 - `macros.h`, `checks.h` and `objects_*.h` are **installed public headers**.
   Livestatus and mod_gearman are still widely deployed and build against them.
-  Internal rewrites are fine; signature and struct changes are not.
+  Internal rewrites are always fine. A struct layout change is only safe
+  together with a `CURRENT_NEB_API_VERSION` bump, which turns a silent memory
+  bug in an unrebuilt module into a refusal to load; do not make one without
+  the other. Changing the signature of an existing function has no such
+  safety net — add a new function instead.
 - Any change to the state file writers must be verified byte-identical against
   the previous implementation, not just "looks right". Diff a full dump with
   the genuinely time-dependent fields normalised.

@@ -35,12 +35,6 @@ static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags);
 static int process_host_check_result(host *hst, host *pre, int *alert_recorded);
 static int handle_host_state(host *hst, int *alert_recorded);
 
-/* see the equivalent struct in checks_service.c */
-struct host_check_job {
-	host *hst;
-	check_result *cr;
-};
-
 /* Extra features */
 static void check_host_result_freshness(struct nm_event_execution_properties *evprop);
 static void check_for_orphaned_hosts_eventhandler(struct nm_event_execution_properties *evprop);
@@ -227,7 +221,6 @@ static int run_async_host_check(host *hst, int check_options, double latency)
 	char *processed_command = NULL;
 	struct timeval start_time, end_time;
 	check_result *cr;
-	struct host_check_job *job;
 	int runchk_result = OK;
 	int macro_options = STRIP_ILLEGAL_MACRO_CHARS | ESCAPE_MACRO_CHARS;
 	int neb_result = OK;
@@ -352,6 +345,12 @@ static int run_async_host_check(host *hst, int check_options, double latency)
 
 	/* save check info */
 	cr->object_check_type = HOST_CHECK;
+	/*
+	 * Hand the host along with the result. Without it the worker callback
+	 * would have to find its way back to this object by name, which is a hash
+	 * lookup plus a string compare for every check that comes back.
+	 */
+	cr->object_ptr = hst;
 	cr->host_name = nm_strdup(hst->name);
 	cr->service_description = NULL;
 	cr->check_type = CHECK_TYPE_ACTIVE;
@@ -377,10 +376,7 @@ static int run_async_host_check(host *hst, int check_options, double latency)
 		return neb_result == NEBERROR_CALLBACKOVERRIDE ? OK : ERROR;
 	}
 
-	job = nm_calloc(1, sizeof(*job));
-	job->hst = hst;
-	job->cr = cr;
-	runchk_result = wproc_run_callback(processed_command, hst->check_timeout, handle_worker_host_check, (void *)job, &mac);
+	runchk_result = wproc_run_callback(processed_command, hst->check_timeout, handle_worker_host_check, (void *)cr, &mac);
 	if (runchk_result == ERROR) {
 		nm_log(NSLOG_RUNTIME_ERROR,
 		       "Unable to send check for host '%s' to worker (ret=%d)\n", hst->name, runchk_result);
@@ -668,8 +664,7 @@ int handle_async_host_check_result(host *temp_host, check_result *cr)
 
 static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags)
 {
-	struct host_check_job *job = (struct host_check_job *)arg;
-	check_result *cr = job->cr;
+	check_result *cr = (check_result *)arg;
 	struct host *hst;
 
 	/* decrement the number of host checks still out there... */
@@ -677,7 +672,7 @@ static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags)
 		currently_running_host_checks--;
 
 	if (wpres) {
-		hst = job->hst;
+		hst = (struct host *)cr->object_ptr;
 		if (hst) {
 			hst->is_executing = FALSE;
 			tv_set(&hst->last_update);
@@ -715,7 +710,6 @@ static void handle_worker_host_check(wproc_result *wpres, void *arg, int flags)
 	}
 	free_check_result(cr);
 	nm_free(cr);
-	nm_free(job);
 }
 
 static gboolean propagate_when_not_up(gpointer _name, gpointer _hst, gpointer user_data)

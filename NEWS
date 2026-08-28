@@ -1,4 +1,16 @@
 Next:
+Breaking changes:
+* increased CURRENT_NEB_API_VERSION, this means you have to recompile your NEB modules.
+  check_result gained an object_ptr member; a module that submits check results may
+  set it to the host/service the result belongs to, or leave it NULL to have naemon
+  look the object up by name as before.
+
+Features:
+* new NEBTYPE_HOSTSTATUS_SCHEDULE / NEBTYPE_SERVICESTATUS_SCHEDULE, sent when only
+  the next check time changed, so modules can tell them apart from real status
+  updates (#162)
+* skip the object lookup when processing check results
+
 Bugfixes:
 * Warn when trailing characters in boolean object directives are ignored. The
   leading 0 or 1 remains authoritative for compatibility.
