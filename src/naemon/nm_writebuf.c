@@ -53,7 +53,7 @@ int nm_writebuf_done(struct nm_writebuf *wb)
 	return error;
 }
 
-#define NM_WB_DBL_CACHE_SIZE 64
+#define NM_WB_DBL_CACHE_SIZE 512
 struct nm_wb_dbl_cache_entry {
 	uint64_t bits;
 	const char *fmt;

@@ -469,6 +469,84 @@ achieved. The remainder is the callback dispatch itself, which still runs:
 does the module return. Buying that last fifth would mean not emitting the
 event, which costs `next_check` for skipped checks — a bad trade for 8 %.
 
+### 9. The double memoization cache was too small
+
+`nm_writebuf.c`
+
+`nm_wb_dbl()` memoizes formatted doubles so that a value like `0.000000` does
+not go through `snprintf()` on every one of the 105 000 objects in a dump. The
+cache held 64 entries, which turned out to be well short of what the real value
+mix needs.
+
+Replaying the exact hash from `nm_wb_dbl()` over the value sequence of a real
+122 MB `retention.dat` — 525 000 double writes, 439 distinct values:
+
+| entries | size | hit rate |
+|---|---|---|
+| 64 (before) | 3 KB | 69.3 % |
+| 128 | 6 KB | 77.3 % |
+| **512** | **24 KB** | **81.2 %** |
+| 1024 – 8192 | 48 – 393 KB | 81.3 % |
+
+512 is the knee; nothing above it buys anything, and 24 KB still fits in L2
+where 196 KB would not. The remaining ~19 % of misses are a property of the
+value mix, not of the cache size.
+
+Measured with `status.dat` on tmpfs written every 2 s, so the writer is about
+half the loop and a change inside it is not buried:
+
+| | µs of loop CPU per check |
+|---|---|
+| 64 entries | 51.73 (51.2 / 51.4 / 52.6) |
+| 512 entries | 50.47 (50.2 / 50.7 / 50.5) |
+
+**−2.4 %**, negative in all three pairs.
+
+**In a default setup this is much smaller.** With the stock 10 s interval on
+disk the writer is roughly a fifth as prominent, and three pairs measured
+26.53 against 26.37 µs — −0.6 % on the means, but the paired deltas were
+−0.6 / +0.2 / −0.1, so at that dilution it is not distinguishable from noise.
+The change is kept because it is one constant, costs 21 KB of BSS, and helps
+in proportion to how often a given installation dumps.
+
+`tests/test-nm-writebuf.c` (new) pins the invariant that makes resizing safe:
+whatever `nm_wb_dbl()` appends must be byte-for-byte what `snprintf()` would
+have produced. It passes unchanged at cache sizes 1, 2, 64, 512 and 4096, which
+is what demonstrates the output does not depend on the size.
+
+### The idea that did not work: printing whole numbers as integers
+
+Many values in both files are doubles that hold whole numbers —
+`check_interval=5.000000`, `percent_state_change=0.00`. Printing those as `5`
+and `0` was tried and measured, and it is recorded here so nobody spends the
+day on it twice.
+
+Of the five double fields per object, three are always integral
+(`percent_state_change` and the two intervals); `check_latency` was integral
+17.6 % of the time and `check_execution_time` 0.2 %.
+
+| | result |
+|---|---|
+| `status.dat` size | −1.40 % |
+| `retention.dat` size | −1.53 % |
+| loop CPU per check | **+0.8 %**, i.e. slightly *worse* |
+
+It fails because the memo cache above already makes a repeated `0.000000` cost
+one `memcpy` of eight bytes. Replacing that with a real integer conversion and
+its digit loop is not cheaper: in the profile `nm_wb_uint` went from 4.00 % to
+4.84 % and a further 1.42 % appeared in the new function, while `nm_wb_dbl`
+only fell from 8.80 % to 7.29 %.
+
+A synthetic micro-benchmark initially showed −52 % for this, which was wrong:
+it used an invented value distribution with roughly 25 000 distinct values
+instead of the real 439, which destroys the cache and invents an advantage that
+does not exist in the real dump. The lesson is the one this document keeps
+repeating — measure the real value distribution before modelling it.
+
+Changing the format would also have to be agreed with whatever reads
+`status.dat` (Thruk, NagVis, PNP4Nagios). naemon itself reads all five fields
+back through `strtod()` and would not have cared.
+
 ---
 
 ## Known bug found but deliberately not fixed
