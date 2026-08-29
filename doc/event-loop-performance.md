@@ -575,6 +575,74 @@ with a performance change. There is a `FIXME` at the site.
 
 ---
 
+## Both broker modules loaded, as in production
+
+The measurements above load one broker module at a time. A real installation
+here runs two: Statusengine for status/event data, and mod_gearman, which takes
+over check execution entirely (it answers `NEBTYPE_SERVICECHECK_INITIATE` with
+`NEBERROR_CALLBACKOVERRIDE`, so naemon's own workers stay idle).
+
+Both were profiled together on this naemon, 5000 hosts / 100 000 services on a
+60s interval, `encryption=yes`, against a real `mod_gearman_worker` and a
+gearmand with the Statusengine queues drained.
+
+Note on load order: naemon stops the callback chain on
+`NEBERROR_CALLBACKOVERRIDE`, and equal priorities are served in load order, so
+whichever module is listed first wins. It does not matter for these two --
+mod_gearman only overrides `NEBTYPE_SERVICECHECK_INITIATE`, and Statusengine
+only consumes `NEBTYPE_SERVICECHECK_PROCESSED`.
+
+### The stock modules cannot keep up
+
+Four interleaved pairs, main thread only:
+
+| | stock modules | patched modules |
+|---|---|---|
+| checks actually performed | 1215 /s | **1640 /s** |
+| of the 1667 /s offered | 72.9 % | **98.4 %** |
+| loop CPU per check | 313.3 µs | **212.8 µs** (−32 %) |
+| loop CPU, share of a core | 38.0 % | 34.9 % |
+| **check latency, mean** | **16.21 s** | **2.09 s** |
+| check latency, p95 | 30.18 s | 5.26 s |
+| check latency, max | 60.00 s | 6.40 s |
+
+With the stock modules a quarter of the services do not get checked within
+their interval at all, and the average check runs 16 seconds behind its
+schedule. That is the number an operator notices, not the CPU percentage.
+
+The two module patches involved are:
+
+- Statusengine skipping `NEBTYPE_*STATUS_SCHEDULE` (change 8 above made that
+  possible). In the profile `broker_service_status` drops from **56.04 % to
+  30.48 %** of the loop.
+- mod_gearman not building a 192 KB stack frame per filtered log line, and
+  fetching its OpenSSL algorithms once instead of per job. `handle_svc_check`
+  drops from **19.56 % to 10.52 %**.
+
+### The loop is blocked, not compute-bound
+
+Worth writing down, because it changes what to optimise next: while the stock
+setup fails to keep up, the gearman queue is *empty*, the worker is *idle*, and
+naemon's main thread sits at **38 % of one core**. Nothing is saturated in the
+usual sense.
+
+mod_gearman's own instrumentation (`log_stats_interval`) explains it:
+
+```
+gearmand submission statistics: jobs: 101237  errors: 0
+  submit_rate: 1690.4/s  avg_submit_duration: 0.000156s  max: 0.001726s
+```
+
+**~160 µs of wall time per job** inside `add_job_to_queue()`, which submits via
+`gearman_client_do_background()` -- a synchronous round-trip to gearmand, once
+per check, on the single-threaded loop. At 1667 checks/s that is 27 % of wall
+clock spent waiting rather than dispatching.
+
+So beyond a point, making the loop cheaper in CPU stops helping; what limits
+throughput is that the loop blocks on I/O it could have issued asynchronously.
+That is a design question for mod_gearman rather than something naemon can fix,
+but it is where the next real gain is for this deployment.
+
 ## What is still hot
 
 Shares of the *reduced* loop, so smaller absolute numbers than the same
