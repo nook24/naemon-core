@@ -92,6 +92,32 @@ $PERF report -i perf.data --children --stdio -g none --percent-limit 1.5
 costs what; `--no-children` (self time) tells you which function to actually
 change. `/proc/sys/kernel/perf_event_paranoid` must be 2 or lower.
 
+## Which fields does a status event actually change?
+
+`statusdiff.c` is a diagnostic broker module that answers this. It keeps a
+snapshot of every field the major broker modules serialise, compares each
+incoming host/service status event against it, and prints a per-NEBTYPE table
+of which fields changed how often when naemon shuts down.
+
+```bash
+gcc -shared -fPIC -o $B/statusdiff.so contrib/perfbench/statusdiff.c \
+    $(pkg-config --cflags naemon) -Wall -O2
+
+sed -i 's|^broker_module=.*|broker_module='$B'/statusdiff.so|' \
+    $B/bench100k/naemon.cfg
+# run for a few check intervals, then:
+kill -TERM $(cat $B/bench100k/var/naemon.pid)
+grep statusdiff $B/bench100k/var/naemon.log
+```
+
+This is what established that `NEBTYPE_*STATUS_SCHEDULE` changes only
+`next_check`, which is the basis for the type split described in
+`doc/event-loop-performance.md`. Use it before assuming anything about what an
+event carries — it is much cheaper than reading every writer of every field.
+
+It is a measurement tool, not something to deploy: it holds a snapshot per
+object and deliberately does the redundant work that real modules should skip.
+
 ## Notes
 
 - Keep the bench directory somewhere that survives a reboot. `/tmp` is cleared

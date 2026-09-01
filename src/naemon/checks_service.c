@@ -139,8 +139,22 @@ void schedule_next_service_check(service *svc, time_t delay, int options)
 	tv_set(&svc->last_update);
 	svc->next_check_event = schedule_event(delay, handle_service_check_event, (void *)svc);
 
-	/* update the status log, since next_check and check_options is updated */
-	update_service_status(svc, FALSE);
+	/*
+	 * Tell modules the schedule moved. Deliberately NOT update_service_status(),
+	 * which would send NEBTYPE_SERVICESTATUS_UPDATE: at this call site nothing
+	 * about the service changed except next_check, check_options and
+	 * last_update, so this goes out as NEBTYPE_SERVICESTATUS_SCHEDULE and a
+	 * module can skip the work of decoding a status it already has. A scheduled
+	 * check produces one of these plus one real update when its result arrives,
+	 * and telling those two apart is what
+	 * https://github.com/naemon/naemon-core/issues/162 asked for.
+	 *
+	 * Two points the type comment in broker.h spells out: this is the only
+	 * event a check that gets scheduled but never run produces, and a
+	 * reschedule from inside handle_async_service_check_result() carries the
+	 * fresh result with it, so not every schedule event is next_check only.
+	 */
+	broker_service_status(NEBTYPE_SERVICESTATUS_SCHEDULE, NEBFLAG_NONE, NEBATTR_NONE, svc);
 }
 
 /* schedules an immediate or delayed service check */

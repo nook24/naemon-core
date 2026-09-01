@@ -108,29 +108,33 @@ Both carry the same `next_check`; the first differs from the second mostly by
 the check's own runtime. So one full serialisation of the service object per
 check is being produced for very little new information.
 
-This has **not** been changed. It is not naemon's call alone to make: dropping
-the event changes what a broker sees, and a consumer that renders `next_check`
-would show it moving one check later than it does today. It is written down
-here because it is where the money is for anyone running a broker, and because
-the decision belongs to the naemon and broker maintainers together rather than
-to a performance patch.
+This is not new. It has been open as
+[naemon/naemon-core#162](https://github.com/naemon/naemon-core/issues/162)
+since 2016, and the Nagios bug tracker had it in 2009 before that. Until now a
+module had no way to tell the duplicate apart from a real update, so the only
+defence was to hash and checksum every event and drop the repeats — expensive,
+and every module had to reinvent it.
 
-It was measured, though, by building a variant with just that one call
-removed and running it against the same load:
+How much this costs was measured by building a variant with that one call
+removed entirely and running it against the same load:
 
 | | µs of loop CPU per check | share of one core |
 |---|---|---|
 | current | 269.5 | 43.5 % |
 | without the reschedule status event | 165.4 | 24.5 % |
 
-**−39 % per check**, from removing a single line. For scale, that is more than
-the whole of the rest of this document put together, and about thirty times
-what is left to win in macro expansion (see below).
+**−39 % per check**, from a single line. For scale, that is more than the whole
+of the rest of this document put together, and about thirty times what is left
+to win in macro expansion (see below).
 
 (The two variants processed check counts differing by 8 %, so the per-check
 normalisation is doing real work here. Even taking the pessimistic reading —
 scaling the cheaper variant up to the same check count — it lands at 8.75 s
 against 14.24 s, which is the same conclusion.)
+
+Removing the event is *not* what was done — see
+[change 8](#8-a-separate-nebtype-for-schedule-only-status-events) below for
+what was, and why.
 
 ---
 
@@ -283,6 +287,150 @@ the caller's stack frame — naemon died at startup with
 It now returns `NSOCK_EINVAL`. Every caller already handles a negative return,
 so `qh_init()` reports a normal configuration error instead.
 
+### 8. A separate NEBTYPE for schedule-only status events
+
+`broker.h`, `checks_service.c`, `checks_host.c`
+
+This addresses the duplicate status event described above, and closes
+[naemon/naemon-core#162](https://github.com/naemon/naemon-core/issues/162).
+
+Two new types:
+
+```c
+#define NEBTYPE_HOSTSTATUS_SCHEDULE              1204
+#define NEBTYPE_SERVICESTATUS_SCHEDULE           1205
+```
+
+`schedule_next_service_check()` and `schedule_next_host_check()` now end with a
+direct `broker_*_status(NEBTYPE_*STATUS_SCHEDULE, ...)` instead of
+`update_*_status()`. That is the whole functional change — two lines.
+
+`update_service_status()` and `update_host_status()` are untouched, and so are
+their other ~28 and ~24 callers in `commands.c`, `downtime.c`, `flapping.c` and
+`notifications.c`. Everything that represents a real change to the object still
+arrives as `NEBTYPE_*STATUS_UPDATE`, exactly as before.
+
+The split had to go on the *schedule* event rather than on the result event.
+Tagging the result event instead would leave the schedule event as 1202, where
+it is indistinguishable from a downtime, an acknowledgement or an external
+command — a module would still have to receive and dedupe it, and the issue
+would not be closed.
+
+**Measured, not assumed.** `contrib/perfbench/statusdiff.c` is a diagnostic
+broker module that snapshots every field the major brokers serialise and
+reports which ones each NEBTYPE actually changes. Over a 5.5-minute run against
+5 000 hosts and 100 000 services:
+
+```
+host NEBTYPE 1201: 10000 events, 0 (0.0%) changed nothing at all
+    has_been_checked           30    0.3%
+    last_check               5000   50.0%
+    latency                  4745   47.5%
+    execution_time           5000   50.0%
+    last_time_up             5000   50.0%
+    plugin_output              30    0.3%
+    long_plugin_output       5000   50.0%
+    perf_data                5000   50.0%
+host NEBTYPE 1204: 10000 events, 0 (0.0%) changed nothing at all
+    next_check              10000  100.0%
+service NEBTYPE 1202: 599977 events, 0 (0.0%) changed nothing at all
+    last_check             499977   83.3%
+    latency                444402   74.1%
+    execution_time         499954   83.3%
+    last_time_ok           499977   83.3%
+    long_plugin_output     100000   16.7%
+    perf_data              100000   16.7%
+service NEBTYPE 1205: 600000 events, 0 (0.0%) changed nothing at all
+    next_check             600000  100.0%
+```
+
+`next_check` changes in 100 % of the schedule events, and in this run nothing
+else did. That is **not** a general property, and a later run showed why.
+
+Repeating the same measurement with checks distributed over mod_gearman instead
+of run by naemon's own workers:
+
+```
+service NEBTYPE 1202: 599680 events, 54781 (9.1%) changed nothing at all
+service NEBTYPE 1205: 654559 events, 0 (0.0%) changed nothing at all
+    next_check             654559  100.0%
+    last_check              54781    8.4%
+    latency                 54781    8.4%
+    execution_time          54702    8.4%
+    check_options          109562   16.7%
+    long_plugin_output      54781    8.4%
+    perf_data               54781    8.4%
+```
+
+**8.4 % of the schedule events carry the fresh check result**, and the ratio is
+1.09:1 rather than 1:1. Both come from the same mechanism:
+`schedule_next_service_check()` also runs from inside
+`handle_async_service_check_result()`, after the result has been written to the
+object. The reschedule at dispatch (`checks_service.c:174`) is skipped while
+`is_executing` is TRUE, which leaves `next_check_event` NULL, and the "make sure
+a check is queued" branch (`:1164`) then does the rescheduling — at a point
+where the object already holds the new state.
+
+So the share is a property of the installation, not of the event type: it
+measures how often a check is still outstanding when its next one falls due.
+With sub-millisecond local checks it is 0 %, over a network 8.4 %, and with slow
+checks it will be higher. The mirror image is the 9.1 % of *update* events that
+change nothing any more, because the preceding schedule event already carried
+the change.
+
+None of this makes the event unsafe to drop: a full update always follows the
+result, and every message is a complete snapshot rather than a delta.
+
+(`check_options` and `last_update` are written too, but no major module
+serialises them. `plugin_output` barely moves for services here because the
+benchmark's check command returns constant output; that is a property of the
+benchmark, not of the event.)
+
+Two consequences a module author needs to know, both documented at the type
+definitions in `broker.h`:
+
+- **Store the second event's data.** The result event carries the fresh state
+  *and* a `next_check` that is equal to or newer than the schedule event's —
+  the retry reschedule (`checks_service.c:1045`) and the "make sure a check is
+  queued" branch (`:1164`) both run *before* the status event on `:1169`.
+  Nothing from the first event is lost.
+
+- **The schedule event is not always redundant.** When a check is scheduled but
+  then not run — host down, check period closed, dependencies or parents
+  failed, checks disabled, result still inside the cache horizon, or
+  `max_parallel_service_checks` reached — it is the *only* event that fires.
+  A module that drops it outright will show a frozen `next_check` for exactly
+  the objects that are not being checked. Handling it with a cheap
+  next_check-only update is the accurate choice; returning early is the fast
+  one.
+
+**The saving lands in the module, not in the core.** naemon still emits the
+event; what the split buys is the ability to not decode and forward it. A
+module that ignores the type sees exactly what it saw before and is unaffected.
+Of the three widely deployed modules, only Statusengine consumes these
+callbacks at all — Livestatus and mod_gearman do not — and Statusengine's
+`StandardCallback::Callback(int, void *)` currently discards the type argument,
+so it needs a small patch to benefit.
+
+That patch was written and measured. Three interleaved pairs, one and the same
+naemon binary, the only difference being whether the module returns early on
+`NEBTYPE_*STATUS_SCHEDULE`:
+
+| | µs of loop CPU per check | share of one core |
+|---|---|---|
+| Statusengine as it is today | 265.1 (258.4 / 261.8 / 275.2) | 42.9 % |
+| skipping the schedule event | 183.3 (177.4 / 186.7 / 185.9) | 29.7 % |
+
+**−30.9 %.** The filtered variant processed 1.28 % *more* checks than the plain
+one across the three pairs — a cheaper loop dispatches more work in the same
+window — so the per-check normalisation is if anything understating the gain.
+
+That is about four fifths of the −39 % that removing the call entirely
+achieved. The remainder is the callback dispatch itself, which still runs:
+`neb_make_callbacks()` walks its list and calls into the module, and only then
+does the module return. Buying that last fifth would mean not emitting the
+event, which costs `next_check` for skipped checks — a bad trade for 8 %.
+
 ---
 
 ## Known bug found but deliberately not fixed
@@ -333,13 +481,15 @@ not be.
 For an installation running a broker module — which is most of them — the
 ranking is not close:
 
-1. **The duplicate `broker_service_status` per check.** −39 %. Needs a decision
-   from the naemon and broker maintainers, not a patch from one side.
+1. **Patch the broker module to skip `NEBTYPE_*STATUS_SCHEDULE`.** −30.9 %,
+   measured. The core side is done (change 8); the saving is only realised
+   once the module stops decoding the event. This is a handful of lines in the
+   module rather than a cross-project decision.
 2. Everything else in this document. Already done, −18 % on top.
 3. Macro expansion. ~1 %.
 
-Optimising naemon further without addressing (1) is polishing a part of the
-system that is no longer where the time goes.
+Optimising naemon further without doing (1) is polishing a part of the system
+that is no longer where the time goes.
 
 ## Things to be careful about when continuing
 
