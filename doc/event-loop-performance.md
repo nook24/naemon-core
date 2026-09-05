@@ -643,6 +643,123 @@ throughput is that the loop blocks on I/O it could have issued asynchronously.
 That is a design question for mod_gearman rather than something naemon can fix,
 but it is where the next real gain is for this deployment.
 
+## Running naemon with jemalloc
+
+The largest single gain left in this deployment needs no code change at all:
+replace glibc's allocator with jemalloc at load time.
+
+| | glibc | jemalloc |
+|---|---|---|
+| Loop CPU per check | 52.8 µs | 46.4 µs (**−12.3 %**) |
+| RSS | 198 MB | 145 MB (**−27 %**) |
+
+Three interleaved pairs at 1 667 checks/s, every run at 100 % coverage; the
+paired deltas were −6.5, −4.4 and −8.6 µs. Measured against jemalloc 5.2.1 on
+top of everything else in this document.
+
+Why it helps this much is visible in the profile: naemon allocates and frees a
+small graph of short-lived objects per check — a check result, a job, several
+`strdup`s, a kvvec — and with a broker module attached, a JSON document on top.
+`_int_malloc` alone was 18.7 % of the loop before the changes described here.
+That is the allocation pattern glibc handles worst and jemalloc's thread caches
+handle well.
+
+### Installing it
+
+Checked against the distributions naemon targets:
+
+| Distribution | Package | Repository | Library |
+|---|---|---|---|
+| RHEL / Rocky / Alma 8 | `jemalloc` 5.2.1 | EPEL | `/usr/lib64/libjemalloc.so.2` |
+| RHEL / Rocky / Alma 9 | `jemalloc` 5.2.1 | EPEL | `/usr/lib64/libjemalloc.so.2` |
+| RHEL / Rocky / Alma 10 | `jemalloc` 5.3.0 | EPEL | `/usr/lib64/libjemalloc.so.2` |
+| Debian 11 / 12 / 13 | `libjemalloc2` | main | `/usr/lib/x86_64-linux-gnu/libjemalloc.so.2` |
+| Ubuntu 22.04 / 24.04 | `libjemalloc2` | main | `/usr/lib/x86_64-linux-gnu/libjemalloc.so.2` |
+
+On RHEL it comes from EPEL rather than base, so `dnf install epel-release` has
+to happen first. Confirm the path before using it — the package name is stable,
+the soname directory is not:
+
+```
+rpm -ql jemalloc | grep '\.so'          # RHEL
+dpkg -L libjemalloc2 | grep '\.so'      # Debian/Ubuntu
+```
+
+### Turning it on
+
+Both packaged systemd units read an environment file, so on a packaged install
+this is one line and no unit editing:
+
+```
+# RHEL: /etc/sysconfig/naemon, installed by the RPM
+LD_PRELOAD=/usr/lib64/libjemalloc.so.2
+
+# Debian/Ubuntu: /etc/default/naemon
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+```
+
+Then `systemctl restart naemon`. A reload is not enough: `ExecReload` sends
+SIGHUP and naemon re-reads its configuration without re-exec'ing, so the running
+process keeps the allocator it started with.
+
+On SUSE the spec strips `EnvironmentFile` out of the unit
+(`naemon-core.spec:160`) and installs no environment file, so use a drop-in
+there. It works everywhere else too, and survives package upgrades:
+
+```
+systemctl edit naemon
+
+[Service]
+Environment=LD_PRELOAD=/usr/lib64/libjemalloc.so.2
+```
+
+Running from a source tree or under the SysV init script, the same variable in
+the environment of whatever starts naemon does the job — that is exactly what
+`contrib/perfbench/` does to produce the numbers above.
+
+### Confirming it took effect
+
+`LD_PRELOAD` fails quietly in the direction that matters. Give it a path that
+does not exist, or a library of the wrong architecture, and ld.so writes one
+warning to stderr and carries on: naemon starts, works, and uses glibc. So
+check rather than assume.
+
+```
+PID=$(cat /run/naemon/naemon.pid)
+grep -c jemalloc /proc/$PID/maps                     # 0 means it is NOT active
+tr '\0' '\n' < /proc/$PID/environ | grep LD_PRELOAD
+ps -o rss= -p $PID                                   # compare against before
+```
+
+The `ExecStartPre` config check runs under `su --login`, which resets the
+environment, so it will not show jemalloc. That step allocates nothing worth
+optimising; only the `ExecStart` process matters.
+
+### Two things to know before rolling it out
+
+**Every child inherits it.** `LD_PRELOAD` is an ordinary environment variable,
+so naemon's check workers — and every plugin they exec — start with jemalloc
+mapped in as well. For a process that lives a few milliseconds that is a
+mapping and an allocator init it had no use for. The measurement above was
+taken on a host that shipped all its checks out through mod_gearman and
+therefore exec'd almost nothing locally. An installation that runs its plugins
+on the naemon host should measure instead of assuming the −12.3 % carries over.
+
+Linking naemon against jemalloc avoids the inheritance entirely, since a
+`DT_NEEDED` entry binds the naemon binary and not anything it execs:
+
+```
+./configure LIBS=-ljemalloc      # needs jemalloc-devel / libjemalloc-dev
+```
+
+That trades the runtime switch for a build-time dependency and a package
+rebuild. It was not tried in this round — every number here is from
+`LD_PRELOAD`.
+
+**Leave `MALLOC_CONF` alone** unless there is a concrete reason to touch it.
+The result above is jemalloc's default configuration, and the RSS saving came
+with it rather than from tuning.
+
 ## What is still hot
 
 Shares of the *reduced* loop, so smaller absolute numbers than the same
@@ -669,8 +786,12 @@ ranking is not close:
    measured. The core side is done (change 8); the saving is only realised
    once the module stops decoding the event. This is a handful of lines in the
    module rather than a cross-project decision.
-2. Everything else in this document. Already done, −18 % on top.
-3. Macro expansion. ~1 %.
+2. **Switch the allocator to jemalloc.** −12.3 % loop CPU and −27 % RSS for a
+   single environment variable — no code change, no rebuild, and it stacks with
+   everything else. See [Running naemon with
+   jemalloc](#running-naemon-with-jemalloc).
+3. Everything else in this document. Already done, −18 % on top.
+4. Macro expansion. ~1 %.
 
 Optimising naemon further without doing (1) is polishing a part of the system
 that is no longer where the time goes.
