@@ -11,7 +11,7 @@
 
 NAGIOS_BEGIN_DECL
 
-/* mmapfile structure - used for reading files via mmap() */
+/* file opened with mmap_fopen(); despite the name, read with stdio */
 typedef struct mmapfile_struct {
 	char *path;
 	int mode;
