@@ -3,20 +3,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include "naemon/checks.h"
 #include "naemon/shared.h"
+#include "naemon/globals.h"
 #include "naemon/nm_alloc.h"
 
 static char spool[] = "/tmp/naemon-spool-XXXXXX";
+static char elsewhere[] = "/tmp/naemon-cwd-XXXXXX";
+static char *old_cwd;
 
 static void setup(void)
 {
 	ck_assert(mkdtemp(spool) != NULL);
+	ck_assert(mkdtemp(elsewhere) != NULL);
+	old_cwd = getcwd(NULL, 0);
 }
 
 static void teardown(void)
 {
+	ck_assert(chdir(old_cwd) == 0);
+	free(old_cwd);
 	rmdir(spool);
+	rmdir(elsewhere);
 }
 
 static char *path_in(const char *dir, const char *name)
@@ -24,6 +35,23 @@ static char *path_in(const char *dir, const char *name)
 	char *p;
 	nm_asprintf(&p, "%s/%s", dir, name);
 	return p;
+}
+
+static void write_file(const char *path, const char *data)
+{
+	FILE *fp = fopen(path, "w");
+	ck_assert(fp != NULL);
+	fputs(data, fp);
+	fclose(fp);
+}
+
+static void make_old(const char *path)
+{
+	struct timeval tv[2];
+	gettimeofday(&tv[0], NULL);
+	tv[0].tv_sec -= 2 * 86400;
+	tv[1] = tv[0];
+	ck_assert(utimes(path, tv) == 0);
 }
 
 /* A spool file another program shrinks while naemon reads it used to raise SIGBUS. */
@@ -58,6 +86,54 @@ START_TEST(file_shrinking_while_read)
 }
 END_TEST
 
+/* Expired files must be removed from the spool directory, not the working directory. */
+START_TEST(expired_file_removed_from_spool)
+{
+	char *f = path_in(spool, "c000002"), *ok = path_in(spool, "c000002.ok");
+	char *decoy = path_in(elsewhere, "c000002"), *decoy_ok = path_in(elsewhere, "c000002.ok");
+
+	write_file(f, "file_time=1\n");
+	write_file(ok, "");
+	make_old(f);
+	write_file(decoy, "");
+	write_file(decoy_ok, "");
+	ck_assert(chdir(elsewhere) == 0);
+
+	max_check_result_file_age = 3600;
+	max_check_reaper_time = 30;
+	process_check_result_queue(spool);
+
+	ck_assert_msg(access(f, F_OK) != 0, "expired check result file was not removed");
+	ck_assert_msg(access(ok, F_OK) != 0, "expired ok-to-go file was not removed");
+	ck_assert_msg(access(decoy, F_OK) == 0, "a file in the working directory was removed");
+	ck_assert_msg(access(decoy_ok, F_OK) == 0, "a file in the working directory was removed");
+
+	unlink(decoy);
+	unlink(decoy_ok);
+	free(f);
+	free(ok);
+	free(decoy);
+	free(decoy_ok);
+}
+END_TEST
+
+/* A result file that cannot be opened is dropped together with its ok-to-go file. */
+START_TEST(unreadable_file_removed_with_ok_file)
+{
+	char *f = path_in(spool, "c000003"), *ok = path_in(spool, "c000003.ok");
+
+	/* a dangling symlink cannot be opened, not even by root */
+	ck_assert(symlink("/nonexistent/naemon-spool-test", f) == 0);
+	write_file(ok, "");
+
+	ck_assert_int_eq(ERROR, process_check_result_file(f));
+	ck_assert_msg(access(ok, F_OK) != 0, "ok-to-go file was left behind");
+
+	free(f);
+	free(ok);
+}
+END_TEST
+
 int main(void)
 {
 	int failed;
@@ -67,6 +143,8 @@ int main(void)
 
 	tcase_add_checked_fixture(tc, setup, teardown);
 	tcase_add_test(tc, file_shrinking_while_read);
+	tcase_add_test(tc, expired_file_removed_from_spool);
+	tcase_add_test(tc, unreadable_file_removed_with_ok_file);
 	suite_add_tcase(s, tc);
 
 	sr = srunner_create(s);

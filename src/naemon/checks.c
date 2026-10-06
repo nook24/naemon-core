@@ -279,7 +279,7 @@ int process_check_result_queue(char *dirname)
 
 			/* if the file is too old, we delete it */
 			if (stat_buf.st_mtime + max_check_result_file_age < time(NULL)) {
-				delete_check_result_file(dirfile->d_name);
+				delete_check_result_file(file);
 				continue;
 			}
 
@@ -378,8 +378,8 @@ int process_check_result_file(char *fname)
 	/* open the file for reading */
 	if ((thefile = mmap_fopen(fname)) == NULL) {
 
-		/* try removing the file - zero length files can't be mmap()'ed, so it might exist */
-		unlink(fname);
+		/* remove it anyway, together with its ok-to-go file */
+		delete_check_result_file(fname);
 
 		return ERROR;
 	}
