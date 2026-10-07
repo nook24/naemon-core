@@ -499,12 +499,14 @@ static int get_dst_shift(time_t *start, time_t *end)
  * A system clock jump needs no handling, because the cache is keyed on the
  * timestamp passed in rather than on wall clock time: a jump simply lands
  * outside the cached window. A timezone switch does need handling, since it
- * changes the answer for timestamps already inside the window. Naemon
- * itself only switches zones in read_main_config_file(), which resets the
- * cache. Behind that, the cache fingerprints the timezone/daylight/tzname
- * globals tzset() maintains and discards itself when they change -- but
- * zones with different DST rules can share a fingerprint (Europe/Amsterdam
- * and Africa/Tunis), so the fingerprint alone is not enough.
+ * changes the answer for timestamps already inside the window. With
+ * use_timezone set, the zone only changes in read_main_config_file(), which
+ * resets the cache. Without it, glibc uses /etc/localtime and re-reads it in
+ * mktime() once it changed, so a system timezone change takes effect without
+ * a reload. The cache therefore also fingerprints the timezone/daylight/tzname
+ * globals glibc updates then. That is not complete -- zones with different
+ * DST rules can share a fingerprint (Europe/Amsterdam and Africa/Tunis) --
+ * hence the explicit reset on reload.
  *
  * tests/test-timeperiod-daycache.c stresses all of the above.
  */
@@ -516,6 +518,7 @@ static int get_dst_shift(time_t *start, time_t *end)
 struct day_cache {
 	time_t midnight;
 	time_t valid_until; /* 0 when this day must not be cached */
+	time_t irregular_from, irregular_until; /* the last day found not cacheable */
 	int year;           /* tm_year/tm_mon/tm_wday as localtime_r() reported */
 	int mon;            /* them for the tested timestamp, before mktime() */
 	int wday;
@@ -574,6 +577,14 @@ static const struct day_cache *get_day_cache(time_t when)
 	t->tm_min = 0;
 	t->tm_hour = 0;
 
+	/* known not to be cacheable: compute it as before, without probing again */
+	if (when >= day_cache.irregular_from && when < day_cache.irregular_until &&
+	    day_cache_tz_matches()) {
+		day_cache.tm = *t;
+		day_cache.midnight = mktime(&day_cache.tm);
+		return &day_cache;
+	}
+
 	/*
 	 * Probe for a DST transition: a local day that is not exactly 86400
 	 * seconds long is not safe to cache. Both ends of the probe are
@@ -596,10 +607,14 @@ static const struct day_cache *get_day_cache(time_t when)
 
 	if (probe_midnight != (time_t) -1 && next_midnight != (time_t) -1 &&
 	    next_midnight - probe_midnight == 86400 &&
-	    day_cache.midnight == probe_midnight)
+	    day_cache.midnight == probe_midnight) {
 		day_cache.valid_until = next_midnight;
-	else
+		day_cache.irregular_from = day_cache.irregular_until = 0;
+	} else {
 		day_cache.valid_until = 0;
+		day_cache.irregular_from = probe_midnight;
+		day_cache.irregular_until = next_midnight;
+	}
 
 	day_cache_store_tz();
 
