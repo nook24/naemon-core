@@ -156,18 +156,11 @@ char *my_strsep(char **stringp, const char *delim)
 }
 
 
-/*
- * Despite the names, these no longer mmap() the file: reading a mapping past
- * the end of a file that shrank meanwhile raises SIGBUS, and the check result
- * spool directory is written by other programs. mmap_buf holds the FILE *.
- */
-
-/* open a file read-only */
-mmapfile *mmap_fopen(const char *filename)
+/* open a file for reading line by line */
+nm_rfile *nm_fopen_ro(const char *filename)
 {
-	mmapfile *new_mmapfile = NULL;
+	nm_rfile *file;
 	FILE *fp;
-	struct stat statbuf;
 
 	if (filename == NULL)
 		return NULL;
@@ -175,64 +168,51 @@ mmapfile *mmap_fopen(const char *filename)
 	if ((fp = fopen(filename, "r")) == NULL)
 		return NULL;
 
-	if (fstat(fileno(fp), &statbuf) == -1) {
-		fclose(fp);
-		return NULL;
-	}
+	file = nm_malloc(sizeof(nm_rfile));
+	file->path = nm_strdup(filename);
+	file->fp = fp;
+	file->current_line = 0L;
 
-	new_mmapfile = nm_malloc(sizeof(mmapfile));
-	new_mmapfile->path = nm_strdup(filename);
-	new_mmapfile->mode = O_RDONLY;
-	new_mmapfile->fd = fileno(fp);
-	new_mmapfile->file_size = (unsigned long)statbuf.st_size;
-	new_mmapfile->current_position = 0L;
-	new_mmapfile->current_line = 0L;
-	new_mmapfile->mmap_buf = fp;
-
-	return new_mmapfile;
+	return file;
 }
 
 
-/* close a file opened with mmap_fopen() */
-int mmap_fclose(mmapfile *temp_mmapfile)
+/* close a file opened with nm_fopen_ro() */
+int nm_fclose(nm_rfile *file)
 {
-
-	if (temp_mmapfile == NULL)
+	if (file == NULL)
 		return ERROR;
 
-	fclose((FILE *)temp_mmapfile->mmap_buf);
-
-	nm_free(temp_mmapfile->path);
-	nm_free(temp_mmapfile);
+	fclose(file->fp);
+	nm_free(file->path);
+	nm_free(file);
 
 	return OK;
 }
 
 
-/* gets one line of input, including its newline, from a file opened with mmap_fopen() */
-char *mmap_fgets(mmapfile *temp_mmapfile)
+/* gets one line of input, including its newline */
+char *nm_fgets(nm_rfile *file)
 {
 	char *buf = NULL;
 	size_t size = 0;
-	ssize_t len;
 
-	if (temp_mmapfile == NULL)
+	if (file == NULL)
 		return NULL;
 
-	if ((len = getline(&buf, &size, (FILE *)temp_mmapfile->mmap_buf)) <= 0) {
+	if (getline(&buf, &size, file->fp) <= 0) {
 		free(buf);
 		return NULL;
 	}
 
-	temp_mmapfile->current_position += len;
-	temp_mmapfile->current_line++;
+	file->current_line++;
 
 	return buf;
 }
 
 
 /* gets one line of input (may be contained on more than one line in the source file) */
-char *mmap_fgets_multiline(mmapfile *temp_mmapfile)
+char *nm_fgets_multiline(nm_rfile *file)
 {
 	char *buf = NULL;
 	char *tempbuf = NULL;
@@ -241,14 +221,14 @@ char *mmap_fgets_multiline(mmapfile *temp_mmapfile)
 	int len2 = 0;
 	int end = 0;
 
-	if (temp_mmapfile == NULL)
+	if (file == NULL)
 		return NULL;
 
 	while (1) {
 
 		nm_free(tempbuf);
 
-		if ((tempbuf = mmap_fgets(temp_mmapfile)) == NULL)
+		if ((tempbuf = nm_fgets(file)) == NULL)
 			break;
 
 		if (buf == NULL) {

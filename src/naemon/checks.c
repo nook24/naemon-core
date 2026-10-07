@@ -357,7 +357,7 @@ int process_check_result(check_result *cr)
 /* reads check result(s) from a file */
 int process_check_result_file(char *fname)
 {
-	mmapfile *thefile = NULL;
+	nm_rfile *thefile = NULL;
 	char *input = NULL;
 	char *var = NULL;
 	char *val = NULL;
@@ -376,7 +376,7 @@ int process_check_result_file(char *fname)
 	log_debug_info(DEBUGL_CHECKS, 1, "Processing check result file: '%s'\n", fname);
 
 	/* open the file for reading */
-	if ((thefile = mmap_fopen(fname)) == NULL) {
+	if ((thefile = nm_fopen_ro(fname)) == NULL) {
 
 		/* remove it anyway, together with its ok-to-go file */
 		delete_check_result_file(fname);
@@ -390,7 +390,7 @@ int process_check_result_file(char *fname)
 		nm_free(input);
 
 		/* read the next line */
-		if ((input = mmap_fgets_multiline(thefile)) == NULL)
+		if ((input = nm_fgets_multiline(thefile)) == NULL)
 			break;
 
 		/* skip comments */
@@ -481,7 +481,7 @@ int process_check_result_file(char *fname)
 	free_check_result(&cr);
 
 	nm_free(input);
-	mmap_fclose(thefile);
+	nm_fclose(thefile);
 
 	/* delete the file (as well its ok-to-go file) */
 	delete_check_result_file(fname);

@@ -58,7 +58,7 @@ static void make_old(const char *path)
 START_TEST(file_shrinking_while_read)
 {
 	char *f = path_in(spool, "c000001");
-	mmapfile *mf;
+	nm_rfile *mf;
 	char *line;
 	FILE *fp;
 	int i;
@@ -69,18 +69,18 @@ START_TEST(file_shrinking_while_read)
 		fprintf(fp, "output=line %d\n", i);
 	fclose(fp);
 
-	mf = mmap_fopen(f);
+	mf = nm_fopen_ro(f);
 	ck_assert(mf != NULL);
-	line = mmap_fgets(mf);
+	line = nm_fgets(mf);
 	ck_assert_str_eq(line, "output=line 0\n");
 	free(line);
 
 	ck_assert(truncate(f, 0) == 0);
 
-	for (i = 0; (line = mmap_fgets(mf)) != NULL; i++)
+	for (i = 0; (line = nm_fgets(mf)) != NULL; i++)
 		free(line);
 	ck_assert_int_lt(i, 100000);
-	mmap_fclose(mf);
+	nm_fclose(mf);
 	unlink(f);
 	free(f);
 }

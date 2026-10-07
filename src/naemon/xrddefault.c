@@ -483,7 +483,7 @@ int xrddefault_read_state_information(void)
 	char *input = NULL;
 	char *inputbuf = NULL;
 	char *temp_ptr = NULL;
-	mmapfile *thefile;
+	nm_rfile *thefile;
 	char *host_name = NULL;
 	char *service_description = NULL;
 	char *contact_name = NULL;
@@ -543,7 +543,7 @@ int xrddefault_read_state_information(void)
 	}
 
 	/* open the retention file for reading */
-	if ((thefile = mmap_fopen(retention_file)) == NULL)
+	if ((thefile = nm_fopen_ro(retention_file)) == NULL)
 		return ERROR;
 
 	/* what attributes should be masked out? */
@@ -563,7 +563,7 @@ int xrddefault_read_state_information(void)
 		nm_free(inputbuf);
 
 		/* read the next line */
-		if ((inputbuf = mmap_fgets(thefile)) == NULL)
+		if ((inputbuf = nm_fgets(thefile)) == NULL)
 			break;
 
 		input = trim(inputbuf);
@@ -1711,7 +1711,7 @@ int xrddefault_read_state_information(void)
 	}
 
 	nm_free(inputbuf);
-	mmap_fclose(thefile);
+	nm_fclose(thefile);
 
 	if (sort_downtime() != OK)
 		return ERROR;
