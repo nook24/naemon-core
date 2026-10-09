@@ -479,9 +479,20 @@ int xrddefault_save_state_information(void)
 		} \
 	} while(0)
 
+/* counts a structural problem in the retention file, remembering the first */
+#define XRD_DAMAGED(what) \
+	do { \
+		if (damaged++ == 0) { \
+			damaged_line = thefile->current_line; \
+			damaged_what = (what); \
+		} \
+	} while (0)
+
 int xrddefault_read_state_information(void)
 {
 	int read_error;
+	unsigned long damaged = 0, damaged_line = 0;
+	const char *damaged_what = NULL;
 	char *input = NULL;
 	char *inputbuf = NULL;
 	char *temp_ptr = NULL;
@@ -575,6 +586,10 @@ int xrddefault_read_state_information(void)
 
 		input = trim(inputbuf);
 
+		/* a block cannot start inside another one */
+		if (data_type != XRDDEFAULT_NO_DATA && *input && input[strlen(input) - 1] == '{')
+			XRD_DAMAGED("a block starts inside another block");
+
 		if (!strcmp(input, "service {")) {
 			memset(&conf, 0, sizeof(conf));
 			memset(&have, 0, sizeof(have));
@@ -601,6 +616,9 @@ int xrddefault_read_state_information(void)
 			data_type = XRDDEFAULT_PROGRAMSTATUS_DATA;
 
 		else if (!strcmp(input, "}")) {
+
+			if (data_type == XRDDEFAULT_NO_DATA)
+				XRD_DAMAGED("'}' outside of a block");
 
 			switch (data_type) {
 
@@ -893,8 +911,11 @@ int xrddefault_read_state_information(void)
 
 			/* slightly faster than strtok () */
 			var = input;
-			if ((val = strchr(input, '=')) == NULL)
+			if ((val = strchr(input, '=')) == NULL) {
+				if (*input && *input != '#')
+					XRD_DAMAGED("a line without '=' inside a block");
 				continue;
+			}
 			val[0] = '\x0';
 			val++;
 
@@ -1715,11 +1736,28 @@ int xrddefault_read_state_information(void)
 				break;
 			}
 		}
+
+		/* outside of a block only comments and empty lines belong */
+		else if (*input && *input != '#') {
+			if (input[strlen(input) - 1] == '{')
+				XRD_DAMAGED("an unknown block");
+			else
+				XRD_DAMAGED("a line outside of a block");
+		}
 	}
 
 	read_error = nm_ferror(thefile);
 	if (read_error)
 		nm_log(NSLOG_RUNTIME_ERROR, "Error: Could not read all of retention data file '%s': %s\n", retention_file, nm_ferror_str(thefile));
+	else if (data_type != XRDDEFAULT_NO_DATA)
+		XRD_DAMAGED("the file ends inside a block");
+
+	if (damaged) {
+		if (retention_strict_loading)
+			nm_log(NSLOG_RUNTIME_ERROR, "Error: Retention data file '%s' is damaged: %s on line %lu, %lu problem(s) in total. Not loading it because retention_strict_loading is enabled.\n", retention_file, damaged_what, damaged_line, damaged);
+		else
+			nm_log(NSLOG_RUNTIME_WARNING, "Warning: Retention data file '%s' is damaged: %s on line %lu, %lu problem(s) in total. The damaged parts were skipped, and the file will be overwritten without them at the next save.\n", retention_file, damaged_what, damaged_line, damaged);
+	}
 
 	nm_free(inputbuf);
 	nm_fclose(thefile);
@@ -1727,5 +1765,5 @@ int xrddefault_read_state_information(void)
 	if (sort_downtime() != OK)
 		return ERROR;
 
-	return read_error ? ERROR : OK;
+	return (read_error || (damaged && retention_strict_loading)) ? ERROR : OK;
 }

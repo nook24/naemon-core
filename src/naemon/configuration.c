@@ -434,6 +434,17 @@ read_config_file(const char *main_config_file, nagios_macros *mac)
 			use_retained_scheduling_info = (atoi(value) > 0) ? TRUE : FALSE;
 		}
 
+		else if (!strcmp(variable, "retention_strict_loading")) {
+
+			if (strlen(value) != 1 || value[0] < '0' || value[0] > '1') {
+				nm_asprintf(&error_message, "Illegal value for retention_strict_loading");
+				error = TRUE;
+				break;
+			}
+
+			retention_strict_loading = (atoi(value) > 0) ? TRUE : FALSE;
+		}
+
 		else if (!strcmp(variable, "retained_scheduling_randomize_window")) {
 
 			retained_scheduling_randomize_window = atoi(value);

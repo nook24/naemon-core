@@ -1,6 +1,7 @@
 #include <check.h>
 #include <glib.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include "naemon/objects_service.h"
@@ -136,6 +137,62 @@ START_TEST(retention_read_error_is_reported)
 }
 END_TEST
 
+/* with retention_strict_loading, each kind of damage makes the load fail */
+struct retention_case {
+	const char *what;
+	const char *content;
+	int expect;
+};
+
+static const struct retention_case retention_cases[] = {
+	{ "valid file", "# comment\n\ninfo {\ncreated=1\n}\n\nprogram {\nmodified_host_attributes=0\n}\n", OK },
+	{ "line without '='", "program {\nmodified_host_attributes=0\ngarbage\n}\n", ERROR },
+	{ "'}' outside of a block", "info {\ncreated=1\n}\n}\n", ERROR },
+	{ "unknown block", "unknown {\nx=1\n}\n", ERROR },
+	{ "line outside of a block", "info {\ncreated=1\n}\ngarbage=1\n", ERROR },
+	{ "block inside a block", "program {\nhost {\nhost_name=my_host\n}\n", ERROR },
+	{ "file ends inside a block", "info {\ncreated=1\n}\nprogram {\nmodified_host_attributes=0\n", ERROR },
+};
+
+START_TEST(retention_damage_detected)
+{
+	const struct retention_case *c = &retention_cases[_i];
+	char path[] = "/tmp/naemon-retention-XXXXXX";
+	int fd = mkstemp(path);
+
+	ck_assert(fd >= 0);
+	ck_assert(write(fd, c->content, strlen(c->content)) == (ssize_t)strlen(c->content));
+	close(fd);
+
+	retention_strict_loading = TRUE;
+	nm_free(retention_file);
+	retention_file = nm_strdup(path);
+	ck_assert_msg(read_initial_state_information() == c->expect, "%s: expected %s", c->what, c->expect == OK ? "OK" : "ERROR");
+	unlink(path);
+}
+END_TEST
+
+/* without retention_strict_loading the undamaged parts are restored */
+START_TEST(retention_damage_keeps_the_rest)
+{
+	FILE *fp;
+
+	hst->long_plugin_output = strdup("restored");
+	ck_assert(OK == save_state_information(0));
+	fp = fopen(retention_file, "a");
+	ck_assert(fp != NULL);
+	fputs("garbage outside of any block\n", fp);
+	fclose(fp);
+
+	teardown_objects();
+	setup_objects();
+
+	retention_strict_loading = FALSE;
+	ck_assert(OK == read_initial_state_information());
+	ck_assert_str_eq(hst->long_plugin_output, "restored");
+}
+END_TEST
+
 Suite *
 retention_suite(void)
 {
@@ -158,6 +215,8 @@ retention_suite(void)
 		tcase_add_checked_fixture(tc_loading, setup, teardown);
 		tcase_add_test(tc_loading, retention_missing_file_is_ok);
 		tcase_add_test(tc_loading, retention_read_error_is_reported);
+		tcase_add_loop_test(tc_loading, retention_damage_detected, 0, sizeof(retention_cases) / sizeof(retention_cases[0]));
+		tcase_add_test(tc_loading, retention_damage_keeps_the_rest);
 		suite_add_tcase(s, tc_loading);
 	}
 	return s;

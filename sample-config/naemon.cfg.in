@@ -489,6 +489,18 @@ use_retained_program_state=1
 use_retained_scheduling_info=1
 
 
+
+# RETENTION STRICT LOADING
+# If the retention file is structurally damaged (lines without '=', unknown
+# or unclosed blocks), Naemon logs a warning, restores the undamaged parts
+# and later overwrites the file. Set this to 1 to have Naemon refuse to start
+# or reload instead, so the file is kept for someone to look at.
+# A file that cannot be read completely always stops Naemon.
+# Values: 0 = continue (default), 1 = abort.
+
+#retention_strict_loading=0
+
+
 # RETAINED_SCHEDULING_RANDOMIZE_WINDOW
 # If use_retained_scheduling info is enabled, this setting
 # sets the window (in seconds), in which checks that were

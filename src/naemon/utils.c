@@ -121,6 +121,7 @@ int retain_state_information = FALSE;
 int retention_update_interval = DEFAULT_RETENTION_UPDATE_INTERVAL;
 int use_retained_program_state = TRUE;
 int use_retained_scheduling_info = FALSE;
+int retention_strict_loading = FALSE;
 int retained_scheduling_randomize_window = DEFAULT_RETAINED_SCHEDULING_RANDOMIZE_WINDOW;
 int retention_scheduling_horizon = DEFAULT_RETENTION_SCHEDULING_HORIZON;
 char *retention_file = NULL;
@@ -1119,6 +1120,7 @@ int reset_variables(void)
 	retention_update_interval = DEFAULT_RETENTION_UPDATE_INTERVAL;
 	use_retained_program_state = TRUE;
 	use_retained_scheduling_info = FALSE;
+	retention_strict_loading = FALSE;
 	retention_scheduling_horizon = DEFAULT_RETENTION_SCHEDULING_HORIZON;
 	modified_host_process_attributes = MODATTR_NONE;
 	modified_service_process_attributes = MODATTR_NONE;

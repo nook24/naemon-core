@@ -1,4 +1,9 @@
 Next:
+Features:
+* new retention_strict_loading option: refuse to start or reload when the retention
+  file is structurally damaged, instead of restoring the undamaged parts and
+  overwriting the file later. Without it, the damage is now at least logged.
+
 Changed:
 * Naemon refuses to start or reload when the retention file exists but cannot be read
   completely (read error, the file changed while being read, or it cannot be opened).
