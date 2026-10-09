@@ -546,9 +546,10 @@ int xrddefault_read_state_information(void)
 
 	/* open the retention file for reading */
 	if ((thefile = nm_fopen_ro(retention_file)) == NULL) {
-		/* a missing file is normal on the first start */
-		if (errno != ENOENT)
-			nm_log(NSLOG_RUNTIME_ERROR, "Error: Cannot open retention data file '%s' for reading: %s\n", retention_file, strerror(errno));
+		/* a missing file is normal on the first start: nothing to restore */
+		if (errno == ENOENT)
+			return OK;
+		nm_log(NSLOG_RUNTIME_ERROR, "Error: Cannot open retention data file '%s' for reading: %s\n", retention_file, strerror(errno));
 		return ERROR;
 	}
 

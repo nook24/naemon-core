@@ -1,5 +1,14 @@
 Next:
+Changed:
+* Naemon refuses to start or reload when the retention file exists but cannot be read
+  completely (read error, the file changed while being read, or it cannot be opened).
+  Before, it restored part of it, or nothing, and overwrote the file at the next save.
+  A missing retention file is still fine.
+
 Bugfixes:
+* reading a file that shrank or failed while being read crashed Naemon with a bus
+  error, for example a check result spool file rewritten by another program
+* expired check result files were not removed from check_result_path
 * Warn when trailing characters in boolean object directives are ignored. The
   leading 0 or 1 remains authoritative for compatibility.
 
