@@ -217,3 +217,40 @@ def warning_does_not_name_directive(context, directive):
 def asdf(context, seconds):
     print('Waiting for %s seconds' % seconds)
     time.sleep(int(seconds))
+
+
+DAMAGED_RETENTION = """########################################
+#          NAEMON STATE RETENTION FILE
+########################################
+info {
+created=1700000000
+version=1.5.2
+}
+program {
+modified_host_attributes=0
+this line has no equals sign
+modified_service_attributes=0
+}
+"""
+
+
+@given('I have a damaged retention file')
+def damaged_retention_file(context):
+    path = context.naemonsysconfig.current_config['state_retention_file']
+    with open(path, 'w') as f:
+        f.write(DAMAGED_RETENTION)
+
+
+@then('the retention file should be unchanged')
+def retention_file_unchanged(context):
+    path = context.naemonsysconfig.current_config['state_retention_file']
+    # slurp_file() strips the trailing newline
+    assert slurp_file(path) == DAMAGED_RETENTION.strip(), (
+        'The retention file was changed'
+    )
+
+
+@then('the naemon log should contain (?P<text>.+)')
+def naemon_log_contains(context, text):
+    log = slurp_file('naemon.log')
+    assert text in log, 'Did not find "%s" in naemon.log:\n%s' % (text, log)

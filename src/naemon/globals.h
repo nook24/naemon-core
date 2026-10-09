@@ -116,6 +116,7 @@ extern int retain_state_information;
 extern int retention_update_interval;
 extern int use_retained_program_state;
 extern int use_retained_scheduling_info;
+extern int retention_strict_loading;
 extern int retained_scheduling_randomize_window;
 extern int retention_scheduling_horizon;
 extern char *retention_file;

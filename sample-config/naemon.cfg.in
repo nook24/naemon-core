@@ -489,6 +489,17 @@ use_retained_program_state=1
 use_retained_scheduling_info=1
 
 
+
+# RETENTION STRICT LOADING
+# If the retention file exists but cannot be loaded completely (a read
+# error, the file changed while being read, or it is structurally damaged),
+# Naemon logs it, restores what it could and later overwrites the file.
+# Set this to 1 to have Naemon refuse to start or reload instead, so the
+# file is kept for someone to look at. Values: 0 = continue (default), 1 = abort.
+
+#retention_strict_loading=0
+
+
 # RETAINED_SCHEDULING_RANDOMIZE_WINDOW
 # If use_retained_scheduling info is enabled, this setting
 # sets the window (in seconds), in which checks that were

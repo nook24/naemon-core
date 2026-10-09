@@ -1,4 +1,9 @@
 Next:
+Features:
+* new retention_strict_loading option: refuse to start or reload when the retention
+  file exists but cannot be loaded completely or is structurally damaged, instead of
+  restoring part of it and overwriting the file later
+
 Bugfixes:
 * Warn when trailing characters in boolean object directives are ignored. The
   leading 0 or 1 remains authoritative for compatibility.
