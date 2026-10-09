@@ -3,6 +3,7 @@
 #include "defaults.h"
 #include "nm_alloc.h"
 #include <string.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -160,6 +161,7 @@ char *my_strsep(char **stringp, const char *delim)
 nm_rfile *nm_fopen_ro(const char *filename)
 {
 	nm_rfile *file;
+	struct stat st;
 	FILE *fp;
 
 	if (filename == NULL)
@@ -168,26 +170,37 @@ nm_rfile *nm_fopen_ro(const char *filename)
 	if ((fp = fopen(filename, "r")) == NULL)
 		return NULL;
 
-	file = nm_malloc(sizeof(nm_rfile));
+	if (fstat(fileno(fp), &st) == -1) {
+		int err = errno;
+		fclose(fp);
+		errno = err;
+		return NULL;
+	}
+
+	file = nm_calloc(1, sizeof(nm_rfile));
 	file->path = nm_strdup(filename);
 	file->fp = fp;
-	file->current_line = 0L;
+	/* only a regular file has a size to compare against */
+	file->size = S_ISREG(st.st_mode) ? st.st_size : -1;
 
 	return file;
 }
 
 
-/* close a file opened with nm_fopen_ro() */
+/* close a file opened with nm_fopen_ro(), ERROR if it was not read completely */
 int nm_fclose(nm_rfile *file)
 {
+	int result;
+
 	if (file == NULL)
 		return ERROR;
 
+	result = nm_ferror(file) ? ERROR : OK;
 	fclose(file->fp);
 	nm_free(file->path);
 	nm_free(file);
 
-	return OK;
+	return result;
 }
 
 
@@ -196,18 +209,44 @@ char *nm_fgets(nm_rfile *file)
 {
 	char *buf = NULL;
 	size_t size = 0;
+	ssize_t len;
 
 	if (file == NULL)
 		return NULL;
 
-	if (getline(&buf, &size, file->fp) <= 0) {
+	if ((len = getline(&buf, &size, file->fp)) <= 0) {
 		free(buf);
+		if (ferror(file->fp))
+			file->error = errno ? errno : EIO;
+		else if (file->size >= 0 && file->bytes_read != file->size)
+			file->changed = TRUE;
 		return NULL;
 	}
 
+	file->bytes_read += len;
 	file->current_line++;
 
 	return buf;
+}
+
+
+/* TRUE if reading stopped at a read error or the file changed size meanwhile */
+int nm_ferror(const nm_rfile *file)
+{
+	return file == NULL || file->error || file->changed;
+}
+
+
+/* describes what nm_ferror() found */
+const char *nm_ferror_str(const nm_rfile *file)
+{
+	if (file == NULL)
+		return "no file";
+	if (file->error)
+		return strerror(file->error);
+	if (file->changed)
+		return "the file changed size while it was being read";
+	return "no error";
 }
 
 

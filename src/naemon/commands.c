@@ -3358,6 +3358,13 @@ int process_external_commands_from_file(char *fname, int delete_file)
 		}
 	}
 
+	/* keep a file that was not read completely, for someone to look at */
+	if (nm_ferror(thefile)) {
+		nm_log(NSLOG_RUNTIME_ERROR, "Error: Could not read all of external command file '%s': %s", fname, nm_ferror_str(thefile));
+		nm_fclose(thefile);
+		return ERROR;
+	}
+
 	/* close the file */
 	nm_fclose(thefile);
 

@@ -6,6 +6,7 @@
 #endif
 
 #include <stdio.h>
+#include <sys/types.h>
 #include <time.h>
 #include "lib/libnaemon.h"
 #include <glib.h>
@@ -17,6 +18,10 @@ typedef struct nm_rfile {
 	char *path;
 	FILE *fp;
 	unsigned long current_line;
+	off_t size;           /* at open, -1 if not a regular file */
+	off_t bytes_read;
+	int error;            /* errno of a read error */
+	int changed;          /* size differed from bytes read at end of file */
 } nm_rfile;
 
 /* official count of first-class objects */
@@ -44,6 +49,8 @@ nm_rfile *nm_fopen_ro(const char *filename);
 int nm_fclose(nm_rfile *file);
 char *nm_fgets(nm_rfile *file);
 char *nm_fgets_multiline(nm_rfile *file);
+int nm_ferror(const nm_rfile *file);
+const char *nm_ferror_str(const nm_rfile *file);
 void strip(char *buffer);
 char *rstrip(char *c);
 char *lstrip(char *c);

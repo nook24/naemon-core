@@ -1144,6 +1144,11 @@ read_config_file(const char *main_config_file, nagios_macros *mac)
 		}
 	}
 
+	if (error == FALSE && nm_ferror(thefile)) {
+		nm_asprintf(&error_message, "Could not read the whole file: %s", nm_ferror_str(thefile));
+		error = TRUE;
+	}
+
 	/* handle errors */
 	if (error == TRUE) {
 		nm_log(NSLOG_CONFIG_ERROR, "Error in configuration file '%s' - Line %d (%s)", main_config_file, current_line, (error_message == NULL) ? "NULL" : error_message);
@@ -1326,6 +1331,11 @@ int read_resource_file(const char *resource_file)
 				}
 			}
 		}
+	}
+
+	if (nm_ferror(thefile)) {
+		nm_log(NSLOG_CONFIG_ERROR, "Error: Could not read all of resource file '%s': %s", resource_file, nm_ferror_str(thefile));
+		error = TRUE;
 	}
 
 	/* free leftover memory and close the file */

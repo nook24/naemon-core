@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -37,13 +38,6 @@ static char *path_in(const char *dir, const char *name)
 	return p;
 }
 
-static void write_file(const char *path, const char *data)
-{
-	FILE *fp = fopen(path, "w");
-	ck_assert(fp != NULL);
-	fputs(data, fp);
-	fclose(fp);
-}
 
 static void make_old(const char *path)
 {
@@ -52,6 +46,14 @@ static void make_old(const char *path)
 	tv[0].tv_sec -= 2 * 86400;
 	tv[1] = tv[0];
 	ck_assert(utimes(path, tv) == 0);
+}
+
+static void write_file(const char *path, const char *data)
+{
+	FILE *fp = fopen(path, "w");
+	ck_assert(fp != NULL);
+	fputs(data, fp);
+	fclose(fp);
 }
 
 /* A spool file another program shrinks while naemon reads it used to raise SIGBUS. */
@@ -80,9 +82,74 @@ START_TEST(file_shrinking_while_read)
 	for (i = 0; (line = nm_fgets(mf)) != NULL; i++)
 		free(line);
 	ck_assert_int_lt(i, 100000);
-	nm_fclose(mf);
+	ck_assert_msg(nm_ferror(mf), "a file that shrank while being read was reported as complete");
+	ck_assert_int_eq(ERROR, nm_fclose(mf));
 	unlink(f);
 	free(f);
+}
+END_TEST
+
+static int read_all(nm_rfile *mf)
+{
+	char *line;
+	int n = 0;
+
+	while ((line = nm_fgets(mf)) != NULL) {
+		free(line);
+		n++;
+	}
+	return n;
+}
+
+START_TEST(complete_read_is_no_error)
+{
+	char *f = path_in(spool, "c000005");
+	nm_rfile *mf;
+
+	write_file(f, "a=1\nb=2\nno newline at the end");
+	mf = nm_fopen_ro(f);
+	ck_assert(mf != NULL);
+	ck_assert_int_eq(3, read_all(mf));
+	ck_assert_int_eq(3, (int)mf->current_line);
+	ck_assert(!nm_ferror(mf));
+	ck_assert_int_eq(OK, nm_fclose(mf));
+	unlink(f);
+	free(f);
+}
+END_TEST
+
+START_TEST(file_growing_while_read)
+{
+	char *f = path_in(spool, "c000006");
+	nm_rfile *mf;
+	FILE *fp;
+
+	write_file(f, "a=1\n");
+	mf = nm_fopen_ro(f);
+	ck_assert(mf != NULL);
+	fp = fopen(f, "a");
+	ck_assert(fp != NULL);
+	fputs("b=2\n", fp);
+	fclose(fp);
+	read_all(mf);
+	ck_assert_msg(nm_ferror(mf), "a file that grew while being read was reported as complete");
+	ck_assert_int_eq(ERROR, nm_fclose(mf));
+	unlink(f);
+	free(f);
+}
+END_TEST
+
+START_TEST(read_error_is_reported)
+{
+	nm_rfile *mf;
+
+	/* a directory opens fine but every read fails with EISDIR */
+	mf = nm_fopen_ro(spool);
+	ck_assert(mf != NULL);
+	ck_assert_int_eq(0, read_all(mf));
+	ck_assert(nm_ferror(mf));
+	ck_assert_str_eq(nm_ferror_str(mf), strerror(EISDIR));
+	ck_assert_int_eq(ERROR, nm_fclose(mf));
 }
 END_TEST
 
@@ -134,6 +201,26 @@ START_TEST(unreadable_file_removed_with_ok_file)
 }
 END_TEST
 
+/* A result file that cannot be read completely is kept for the next run. */
+START_TEST(incomplete_result_file_is_kept)
+{
+	char *f = path_in(spool, "c000007"), *ok = path_in(spool, "c000007.ok");
+
+	/* a directory under a result file name: opens, but cannot be read */
+	ck_assert(mkdir(f, 0700) == 0);
+	write_file(ok, "");
+
+	ck_assert_int_eq(ERROR, process_check_result_file(f));
+	ck_assert_msg(access(f, F_OK) == 0, "incompletely read result file was removed");
+	ck_assert_msg(access(ok, F_OK) == 0, "ok-to-go file of an incompletely read result file was removed");
+
+	unlink(ok);
+	rmdir(f);
+	free(f);
+	free(ok);
+}
+END_TEST
+
 int main(void)
 {
 	int failed;
@@ -145,6 +232,10 @@ int main(void)
 	tcase_add_test(tc, file_shrinking_while_read);
 	tcase_add_test(tc, expired_file_removed_from_spool);
 	tcase_add_test(tc, unreadable_file_removed_with_ok_file);
+	tcase_add_test(tc, complete_read_is_no_error);
+	tcase_add_test(tc, file_growing_while_read);
+	tcase_add_test(tc, read_error_is_reported);
+	tcase_add_test(tc, incomplete_result_file_is_kept);
 	suite_add_tcase(s, tc);
 
 	sr = srunner_create(s);

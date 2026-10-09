@@ -293,9 +293,9 @@ int process_check_result_queue(char *dirname)
 			/* process the file */
 			result = process_check_result_file(file);
 
-			/* break out if we encountered an error */
+			/* a file that could not be read must not hold up the others */
 			if (result == ERROR)
-				break;
+				continue;
 
 			check_result_files++;
 		}
@@ -358,6 +358,8 @@ int process_check_result(check_result *cr)
 int process_check_result_file(char *fname)
 {
 	nm_rfile *thefile = NULL;
+	GPtrArray *lines;
+	unsigned int i;
 	char *input = NULL;
 	char *var = NULL;
 	char *val = NULL;
@@ -384,14 +386,24 @@ int process_check_result_file(char *fname)
 		return ERROR;
 	}
 
-	/* read in all lines from the file */
-	while (1) {
+	/*
+	 * Read the whole file before acting on any of it: a file that cannot be
+	 * read completely, or changes while being read, is left for the next
+	 * run instead of being processed in part.
+	 */
+	lines = g_ptr_array_new_with_free_func(free);
+	while ((input = nm_fgets_multiline(thefile)) != NULL)
+		g_ptr_array_add(lines, input);
+	if (nm_ferror(thefile)) {
+		nm_log(NSLOG_RUNTIME_WARNING, "Warning: Could not read all of check result file '%s', will retry: %s\n", fname, nm_ferror_str(thefile));
+		nm_fclose(thefile);
+		g_ptr_array_free(lines, TRUE);
+		return ERROR;
+	}
+	nm_fclose(thefile);
 
-		nm_free(input);
-
-		/* read the next line */
-		if ((input = nm_fgets_multiline(thefile)) == NULL)
-			break;
+	for (i = 0; i < lines->len; i++) {
+		input = g_ptr_array_index(lines, i);
 
 		/* skip comments */
 		if (input[0] == '#')
@@ -479,9 +491,7 @@ int process_check_result_file(char *fname)
 	}
 
 	free_check_result(&cr);
-
-	nm_free(input);
-	nm_fclose(thefile);
+	g_ptr_array_free(lines, TRUE);
 
 	/* delete the file (as well its ok-to-go file) */
 	delete_check_result_file(fname);

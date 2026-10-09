@@ -8516,6 +8516,11 @@ static int xodtemplate_process_config_file(char *filename)
 		}
 	}
 
+	if (result == OK && nm_ferror(thefile)) {
+		nm_log(NSLOG_CONFIG_ERROR, "Error: Could not read all of config file '%s': %s\n", filename, nm_ferror_str(thefile));
+		result = ERROR;
+	}
+
 	nm_free(inputbuf);
 	nm_fclose(thefile);
 
